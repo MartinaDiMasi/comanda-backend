@@ -67,7 +67,14 @@ function withDB(mutatorFn) {
 }
 
 function nowHHMM() {
-  return new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }) + 'hs';
+  // OJO: sin especificar timeZone, esto usa la hora del servidor (Render
+  // corre en UTC), que va 3 horas adelantada respecto a Argentina.
+  // Por eso forzamos explícitamente la zona horaria acá.
+  return new Date().toLocaleTimeString('es-AR', {
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'America/Argentina/Buenos_Aires',
+  }) + 'hs';
 }
 
 function randomCode() {
