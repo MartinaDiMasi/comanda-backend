@@ -67,7 +67,7 @@ function withDB(mutatorFn) {
 }
 
 function nowHHMM() {
-  return new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }) + 'hs';
+  return new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Argentina/Buenos_Aires' }) + 'hs';
 }
 
 function randomCode() {
