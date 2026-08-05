@@ -67,14 +67,7 @@ function withDB(mutatorFn) {
 }
 
 function nowHHMM() {
-  // OJO: sin especificar timeZone, esto usa la hora del servidor (Render
-  // corre en UTC), que va 3 horas adelantada respecto a Argentina.
-  // Por eso forzamos explícitamente la zona horaria acá.
-  return new Date().toLocaleTimeString('es-AR', {
-    hour: '2-digit',
-    minute: '2-digit',
-    timeZone: 'America/Argentina/Buenos_Aires',
-  }) + 'hs';
+  return new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }) + 'hs';
 }
 
 function randomCode() {
@@ -167,6 +160,45 @@ app.patch('/api/orders/:id', async (req, res) => {
 
   if (!updated) return res.status(404).json({ error: 'Pedido no encontrado.' });
   res.json(updated);
+});
+
+// ----------------------------------------------------------------
+// DELETE /api/orders/:id
+// Elimina un pedido puntual (lo usa el botón "Eliminar" del panel).
+// ----------------------------------------------------------------
+app.delete('/api/orders/:id', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+
+  const existed = await withDB((db) => {
+    const before = db.orders.length;
+    db.orders = db.orders.filter(o => o.id !== id);
+    return db.orders.length !== before;
+  });
+
+  if (!existed) return res.status(404).json({ error: 'Pedido no encontrado.' });
+  res.json({ ok: true });
+});
+
+// ----------------------------------------------------------------
+// POST /api/orders/clear
+// Borra en lote todos los pedidos que estén en alguno de los
+// estados indicados (pensado para "Vaciar completados y
+// cancelados" y así no dejar que el panel se llene de pedidos
+// viejos). Body esperado: { statuses: ["completado","cancelado"] }
+// ----------------------------------------------------------------
+app.post('/api/orders/clear', async (req, res) => {
+  const statuses = Array.isArray(req.body?.statuses) ? req.body.statuses : [];
+  if (statuses.length === 0) {
+    return res.status(400).json({ error: 'Falta indicar qué estados vaciar.' });
+  }
+
+  const deleted = await withDB((db) => {
+    const before = db.orders.length;
+    db.orders = db.orders.filter(o => !statuses.includes(o.status));
+    return before - db.orders.length;
+  });
+
+  res.json({ ok: true, deleted });
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
