@@ -5,10 +5,21 @@
 // expone por una API REST. El panel de control los consulta cada
 // pocos segundos (polling) para enterarse de pedidos nuevos.
 //
-// Endpoints:
-//   GET    /api/orders            -> lista todos los pedidos
+// MULTI-TENANCY: este backend puede atender a varios comercios a la
+// vez. Cada request tiene que identificar la tienda con el header
+// "X-Store-Key" (ver stores.json y la función requireStore más abajo).
+// Sin esa clave, ningún endpoint de /api/orders responde. Cada pedido
+// queda etiquetado con su "store", y todas las lecturas/escrituras se
+// filtran por ese campo, así los datos de una tienda nunca se mezclan
+// ni son visibles desde otra.
+//
+// Endpoints (todos requieren header X-Store-Key salvo /api/health):
+//   GET    /api/orders            -> lista los pedidos de ESA tienda
 //   POST   /api/orders            -> crea un pedido nuevo (lo usa la tienda)
 //   PATCH  /api/orders/:id        -> actualiza status / tags / agrega nota
+//   DELETE /api/orders/:id        -> borra un pedido puntual
+//   DELETE /api/orders/demo       -> borra los pedidos de la demo de ESA tienda
+//   POST   /api/orders/clear      -> vacía pedidos por estado, de ESA tienda
 //   GET    /api/health            -> chequeo simple de que el server vive
 // ================================================================
 
@@ -20,15 +31,71 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DB_FILE = path.join(__dirname, 'orders.json');
+const STORES_FILE = path.join(__dirname, 'stores.json');
 
 // ----------------------------------------------------------------
-// CORS: en producción, reemplazá el '*' por el dominio real de tu
-// tienda (ej: "https://mi-comercio.com") para que solo tu propia
-// página pueda mandar pedidos a este backend.
+// CORS: en producción, reemplazá el '*' por el/los dominios reales
+// de tus tiendas (ej: "https://mi-comercio.com") para que solo esas
+// páginas puedan mandar pedidos a este backend.
 // ----------------------------------------------------------------
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.json());
+
+// ----------------------------------------------------------------
+// MULTI-TENANCY
+// ----------------------------------------------------------------
+// Este mismo backend puede atender a varios comercios distintos.
+// Para que los pedidos de uno NUNCA se mezclen ni se puedan ver
+// desde otro, cada tienda tiene una "clave" secreta (storeKey) que
+// el catálogo y el panel mandan en cada request via el header
+// "X-Store-Key". Esa clave se mapea a un "storeId" interno, y TODOS
+// los datos se guardan/filtran usando ese storeId.
+//
+// Las claves y sus IDs viven en stores.json (ver ese archivo). Para
+// dar de alta un comercio nuevo, agregá una entrada ahí — no hace
+// falta tocar este archivo ni la base de pedidos.
+//
+// Formato de stores.json:
+// { "<storeKey>": "<storeId>", "<storeKey>": "<storeId>", ... }
+// ----------------------------------------------------------------
+function loadStores() {
+  if (!fs.existsSync(STORES_FILE)) {
+    console.error(
+      'ATENCIÓN: no existe stores.json. Ningún request va a poder ' +
+      'identificarse y todos los endpoints van a devolver 401. ' +
+      'Creá stores.json con al menos una tienda (ver stores.example.json).'
+    );
+    return {};
+  }
+  try {
+    return JSON.parse(fs.readFileSync(STORES_FILE, 'utf8'));
+  } catch (e) {
+    console.error('Error leyendo stores.json:', e);
+    return {};
+  }
+}
+
+// Middleware: identifica qué tienda está haciendo el request a partir
+// del header "X-Store-Key" y lo guarda en req.storeId. Si la clave no
+// viene o no es válida, corta acá con 401 (así una tienda nunca puede
+// listar, editar ni borrar pedidos de otra, ni siquiera adivinando IDs).
+function requireStore(req, res, next) {
+  const storeKey = req.header('X-Store-Key');
+  if (!storeKey) {
+    return res.status(401).json({ error: 'Falta el header X-Store-Key.' });
+  }
+  const stores = loadStores();
+  const storeId = stores[storeKey];
+  if (!storeId) {
+    return res.status(401).json({ error: 'Clave de tienda inválida.' });
+  }
+  req.storeId = storeId;
+  next();
+}
+
+// Todos los endpoints de /api/orders* requieren identificar la tienda.
+app.use('/api/orders', requireStore);
 
 // ----------------------------------------------------------------
 // Persistencia muy simple en un archivo JSON.
@@ -80,7 +147,7 @@ function randomCode() {
 // ----------------------------------------------------------------
 app.get('/api/orders', (req, res) => {
   const db = readDB();
-  res.json(db.orders);
+  res.json(db.orders.filter(o => o.store === req.storeId));
 });
 
 // ----------------------------------------------------------------
@@ -107,6 +174,7 @@ app.post('/api/orders', async (req, res) => {
   const order = await withDB((db) => {
     const newOrder = {
       id: db.nextId,
+      store: req.storeId,
       code: randomCode(),
       client: (body.client && String(body.client).trim()) || 'Sin nombre',
       phone: body.phone ? String(body.phone) : '',
@@ -118,9 +186,21 @@ app.post('/api/orders', async (req, res) => {
         price: Number(i.price) || 0,
       })),
       shipping: Number(body.shipping) || 0,
+      payment: body.payment ? String(body.payment) : '',
+      address: body.address ? String(body.address) : '',
       time: nowHHMM(),
       createdAt: new Date().toISOString(),
-      notes: body.note ? [{ text: String(body.note), time: nowHHMM() }] : [],
+      // "origin: 'client'" identifica la nota que dejó el cliente al hacer
+      // el pedido (se usa para el comprobante en PDF). Los comentarios que
+      // el panel agrega después via PATCH no llevan este campo, para no
+      // mezclarse con anotaciones internas del equipo.
+      notes: body.note ? [{ text: String(body.note), time: nowHHMM(), origin: 'client' }] : [],
+      // "demo: true" marca los pedidos generados por el Modo Demo del
+      // panel (ver comanda-con-panel.html). Viajan por el mismo POST que
+      // un pedido real para no duplicar lógica; este flag solo sirve para
+      // poder identificarlos y borrarlos en bloque después (ver
+      // DELETE /api/orders/demo más abajo). Nunca se muestra al cliente.
+      demo: body.demo === true,
     };
     db.orders.unshift(newOrder);
     db.nextId += 1;
@@ -143,7 +223,7 @@ app.patch('/api/orders/:id', async (req, res) => {
   const body = req.body || {};
 
   const updated = await withDB((db) => {
-    const order = db.orders.find(o => o.id === id);
+    const order = db.orders.find(o => o.id === id && o.store === req.storeId);
     if (!order) return null;
 
     if (typeof body.status === 'string') {
@@ -163,6 +243,25 @@ app.patch('/api/orders/:id', async (req, res) => {
 });
 
 // ----------------------------------------------------------------
+// DELETE /api/orders/demo
+// Borra únicamente los pedidos generados por el Modo Demo del panel
+// (los que tienen demo:true), sin tocar los pedidos reales. Lo usa el
+// botón "Reiniciar datos de la demo".
+// IMPORTANTE: esta ruta tiene que estar declarada ANTES que
+// DELETE /api/orders/:id, si no Express interpretaría "demo" como un
+// :id y nunca llegaría acá.
+// ----------------------------------------------------------------
+app.delete('/api/orders/demo', async (req, res) => {
+  const deleted = await withDB((db) => {
+    const before = db.orders.length;
+    db.orders = db.orders.filter(o => !(o.demo && o.store === req.storeId));
+    return before - db.orders.length;
+  });
+
+  res.json({ ok: true, deleted });
+});
+
+// ----------------------------------------------------------------
 // DELETE /api/orders/:id
 // Elimina un pedido puntual (lo usa el botón "Eliminar" del panel).
 // ----------------------------------------------------------------
@@ -171,7 +270,7 @@ app.delete('/api/orders/:id', async (req, res) => {
 
   const existed = await withDB((db) => {
     const before = db.orders.length;
-    db.orders = db.orders.filter(o => o.id !== id);
+    db.orders = db.orders.filter(o => !(o.id === id && o.store === req.storeId));
     return db.orders.length !== before;
   });
 
@@ -194,7 +293,7 @@ app.post('/api/orders/clear', async (req, res) => {
 
   const deleted = await withDB((db) => {
     const before = db.orders.length;
-    db.orders = db.orders.filter(o => !statuses.includes(o.status));
+    db.orders = db.orders.filter(o => !(o.store === req.storeId && statuses.includes(o.status)));
     return before - db.orders.length;
   });
 
@@ -206,3 +305,4 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.listen(PORT, () => {
   console.log(`Backend de pedidos corriendo en el puerto ${PORT}`);
 });
+
