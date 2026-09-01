@@ -1,17 +1,27 @@
 // ================================================================
 // BACKEND — Centro de pedidos "Comanda"
 // ----------------------------------------------------------------
-// Guarda los pedidos en un archivo JSON en disco (orders.json) y los
+// Guarda los pedidos y el catálogo en Supabase (Postgres) y los
 // expone por una API REST. El panel de control los consulta cada
 // pocos segundos (polling) para enterarse de pedidos nuevos.
+//
+// POR QUÉ SUPABASE Y NO ARCHIVOS JSON EN DISCO:
+// Este backend corre en un plan gratuito de Render, que tiene el
+// filesystem efímero: cualquier archivo que el server escriba en
+// disco (como antes orders.json / products.json) se BORRA cada vez
+// que el servicio se reinicia — y eso pasa solo, cada vez que Render
+// "duerme" el servicio por inactividad y luego lo despierta. Guardar
+// los datos en Supabase en vez de en disco evita ese problema: los
+// datos viven en la base, no en el contenedor.
 //
 // MULTI-TENANCY: este backend puede atender a varios comercios a la
 // vez. Cada request tiene que identificar la tienda con el header
 // "X-Store-Key" (ver stores.json y la función requireStore más abajo).
-// Sin esa clave, ningún endpoint de /api/orders responde. Cada pedido
-// queda etiquetado con su "store", y todas las lecturas/escrituras se
-// filtran por ese campo, así los datos de una tienda nunca se mezclan
-// ni son visibles desde otra.
+// Sin esa clave, ningún endpoint de /api/orders ni /api/products
+// responde. Cada fila queda etiquetada con su "store" (columna
+// "store"), y todas las lecturas/escrituras se filtran por esa
+// columna, así los datos de una tienda nunca se mezclan ni son
+// visibles desde otra.
 //
 // Endpoints (todos requieren header X-Store-Key salvo /api/health):
 //   GET    /api/orders            -> lista los pedidos de ESA tienda
@@ -37,11 +47,10 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DB_FILE = path.join(__dirname, 'orders.json');
-const PRODUCTS_FILE = path.join(__dirname, 'products.json');
 const STORES_FILE = path.join(__dirname, 'stores.json');
 
 // ----------------------------------------------------------------
@@ -51,21 +60,38 @@ const STORES_FILE = path.join(__dirname, 'stores.json');
 // ----------------------------------------------------------------
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 app.use(cors({ origin: ALLOWED_ORIGIN }));
-app.use(express.json());
+app.use(express.json({ limit: '5mb' })); // límite más alto: los productos pueden traer fotos en base64
+
+// ----------------------------------------------------------------
+// CONEXIÓN A SUPABASE
+// ----------------------------------------------------------------
+// SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY salen del panel de tu
+// proyecto en Supabase (Project Settings -> API) y se configuran
+// como variables de entorno en Render (nunca hardcodeadas acá).
+// Usamos la "service role key" (no la "anon key") porque este
+// backend es el único que habla con la base, y él mismo ya se ocupa
+// de separar los datos por tienda con requireStore/X-Store-Key.
+// ----------------------------------------------------------------
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.error(
+    'ATENCIÓN: faltan las variables de entorno SUPABASE_URL y/o ' +
+    'SUPABASE_SERVICE_ROLE_KEY. El backend no va a poder leer ni ' +
+    'guardar pedidos ni productos. Configuralas en Render (Environment).'
+  );
+}
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 // ----------------------------------------------------------------
 // MULTI-TENANCY
 // ----------------------------------------------------------------
-// Este mismo backend puede atender a varios comercios distintos.
-// Para que los pedidos de uno NUNCA se mezclen ni se puedan ver
-// desde otro, cada tienda tiene una "clave" secreta (storeKey) que
-// el catálogo y el panel mandan en cada request via el header
-// "X-Store-Key". Esa clave se mapea a un "storeId" interno, y TODOS
-// los datos se guardan/filtran usando ese storeId.
-//
-// Las claves y sus IDs viven en stores.json (ver ese archivo). Para
-// dar de alta un comercio nuevo, agregá una entrada ahí — no hace
-// falta tocar este archivo ni la base de pedidos.
+// stores.json sigue viviendo como archivo (no en Supabase): es un
+// archivo chico que se sube junto con el código (parte del repo), no
+// algo que el server escriba en tiempo de ejecución, así que el
+// filesystem efímero de Render no lo afecta. Para dar de alta un
+// comercio nuevo, agregá una entrada ahí y volvé a desplegar.
 //
 // Formato de stores.json:
 // { "<storeKey>": "<storeId>", "<storeKey>": "<storeId>", ... }
@@ -111,71 +137,27 @@ app.use('/api/orders', requireStore);
 app.use('/api/products', requireStore);
 
 // ----------------------------------------------------------------
-// Persistencia muy simple en un archivo JSON.
-// Alcanza de sobra para un solo comercio con un panel. Si en el
-// futuro necesitás más volumen o varias sucursales, esto se puede
-// migrar a una base de datos real (Postgres, SQLite, etc.) sin
-// tocar los endpoints de arriba.
+// Persistencia en Supabase.
 // ----------------------------------------------------------------
-function readDB() {
-  if (!fs.existsSync(DB_FILE)) {
-    return { nextId: 1025, orders: [] };
-  }
-  try {
-    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  } catch (e) {
-    console.error('Error leyendo orders.json, arranco desde cero:', e);
-    return { nextId: 1025, orders: [] };
-  }
-}
-
-function writeDB(db) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-}
-
-// Evita escrituras simultáneas pisándose entre sí (por si llegan dos
-// pedidos casi al mismo tiempo).
-let writeQueue = Promise.resolve();
-function withDB(mutatorFn) {
-  writeQueue = writeQueue.then(() => {
-    const db = readDB();
-    const result = mutatorFn(db);
-    writeDB(db);
-    return result;
-  });
-  return writeQueue;
-}
-
+// Tanto "orders" como "products" viven en Supabase con la misma
+// forma de tabla: una columna "id" (autonumérica, la genera Postgres
+// solo), una columna "store" (a qué tienda pertenece la fila) y una
+// columna "data" (jsonb) con TODO el resto de la información del
+// pedido/producto (client, items, tags, notes, cat, price, img...).
+//
+// Guardar el resto de los campos como jsonb (en vez de una columna
+// por campo) es justamente lo que nos permite no tener que rediseñar
+// una tabla cada vez que se agrega un campo nuevo al pedido o al
+// producto — es el mismo comportamiento flexible que tenían los
+// objetos sueltos en orders.json / products.json, pero ahora
+// persistido en una base de verdad.
+//
+// row2obj junta "id" + "store" + lo de adentro de "data" en un solo
+// objeto plano, que es la forma en la que el panel y el catálogo ya
+// esperan recibir los pedidos/productos (igual que antes).
 // ----------------------------------------------------------------
-// Persistencia de PRODUCTOS (catálogo), en un archivo aparte
-// (products.json) pero con la misma lógica que orders.json: cada
-// producto queda etiquetado con "store" y todo se filtra por ahí.
-// ----------------------------------------------------------------
-function readProductsDB() {
-  if (!fs.existsSync(PRODUCTS_FILE)) {
-    return { nextId: 1, products: [] };
-  }
-  try {
-    return JSON.parse(fs.readFileSync(PRODUCTS_FILE, 'utf8'));
-  } catch (e) {
-    console.error('Error leyendo products.json, arranco desde cero:', e);
-    return { nextId: 1, products: [] };
-  }
-}
-
-function writeProductsDB(db) {
-  fs.writeFileSync(PRODUCTS_FILE, JSON.stringify(db, null, 2));
-}
-
-let productsWriteQueue = Promise.resolve();
-function withProductsDB(mutatorFn) {
-  productsWriteQueue = productsWriteQueue.then(() => {
-    const db = readProductsDB();
-    const result = mutatorFn(db);
-    writeProductsDB(db);
-    return result;
-  });
-  return productsWriteQueue;
+function row2obj(row) {
+  return { id: row.id, store: row.store, ...row.data };
 }
 
 function nowHHMM() {
@@ -190,9 +172,18 @@ function randomCode() {
 // GET /api/orders
 // El panel llama esto cada pocos segundos para refrescarse.
 // ----------------------------------------------------------------
-app.get('/api/orders', (req, res) => {
-  const db = readDB();
-  res.json(db.orders.filter(o => o.store === req.storeId));
+app.get('/api/orders', async (req, res) => {
+  const { data, error } = await supabase
+    .from('orders')
+    .select('id, store, data')
+    .eq('store', req.storeId)
+    .order('id', { ascending: false }); // más nuevo primero, igual que antes (unshift)
+
+  if (error) {
+    console.error('Error leyendo pedidos de Supabase:', error);
+    return res.status(500).json({ error: 'No se pudieron leer los pedidos.' });
+  }
+  res.json(data.map(row2obj));
 });
 
 // ----------------------------------------------------------------
@@ -216,43 +207,46 @@ app.post('/api/orders', async (req, res) => {
     return res.status(400).json({ error: 'El pedido no tiene productos.' });
   }
 
-  const order = await withDB((db) => {
-    const newOrder = {
-      id: db.nextId,
-      store: req.storeId,
-      code: randomCode(),
-      client: (body.client && String(body.client).trim()) || 'Sin nombre',
-      phone: body.phone ? String(body.phone) : '',
-      status: 'nuevo',
-      tags: Array.isArray(body.tags) ? body.tags : [],
-      items: body.items.map(i => ({
-        name: String(i.name),
-        qty: Number(i.qty) || 1,
-        price: Number(i.price) || 0,
-      })),
-      shipping: Number(body.shipping) || 0,
-      payment: body.payment ? String(body.payment) : '',
-      address: body.address ? String(body.address) : '',
-      time: nowHHMM(),
-      createdAt: new Date().toISOString(),
-      // "origin: 'client'" identifica la nota que dejó el cliente al hacer
-      // el pedido (se usa para el comprobante en PDF). Los comentarios que
-      // el panel agrega después via PATCH no llevan este campo, para no
-      // mezclarse con anotaciones internas del equipo.
-      notes: body.note ? [{ text: String(body.note), time: nowHHMM(), origin: 'client' }] : [],
-      // "demo: true" marca los pedidos generados por el Modo Demo del
-      // panel (ver comanda-con-panel.html). Viajan por el mismo POST que
-      // un pedido real para no duplicar lógica; este flag solo sirve para
-      // poder identificarlos y borrarlos en bloque después (ver
-      // DELETE /api/orders/demo más abajo). Nunca se muestra al cliente.
-      demo: body.demo === true,
-    };
-    db.orders.unshift(newOrder);
-    db.nextId += 1;
-    return newOrder;
-  });
+  const orderData = {
+    code: randomCode(),
+    client: (body.client && String(body.client).trim()) || 'Sin nombre',
+    phone: body.phone ? String(body.phone) : '',
+    status: 'nuevo',
+    tags: Array.isArray(body.tags) ? body.tags : [],
+    items: body.items.map(i => ({
+      name: String(i.name),
+      qty: Number(i.qty) || 1,
+      price: Number(i.price) || 0,
+    })),
+    shipping: Number(body.shipping) || 0,
+    payment: body.payment ? String(body.payment) : '',
+    address: body.address ? String(body.address) : '',
+    time: nowHHMM(),
+    createdAt: new Date().toISOString(),
+    // "origin: 'client'" identifica la nota que dejó el cliente al hacer
+    // el pedido (se usa para el comprobante en PDF). Los comentarios que
+    // el panel agrega después via PATCH no llevan este campo, para no
+    // mezclarse con anotaciones internas del equipo.
+    notes: body.note ? [{ text: String(body.note), time: nowHHMM(), origin: 'client' }] : [],
+    // "demo: true" marca los pedidos generados por el Modo Demo del
+    // panel (ver comanda-con-panel.html). Viajan por el mismo POST que
+    // un pedido real para no duplicar lógica; este flag solo sirve para
+    // poder identificarlos y borrarlos en bloque después (ver
+    // DELETE /api/orders/demo más abajo). Nunca se muestra al cliente.
+    demo: body.demo === true,
+  };
 
-  res.status(201).json(order);
+  const { data, error } = await supabase
+    .from('orders')
+    .insert({ store: req.storeId, data: orderData })
+    .select('id, store, data')
+    .single();
+
+  if (error) {
+    console.error('Error creando pedido en Supabase:', error);
+    return res.status(500).json({ error: 'No se pudo guardar el pedido.' });
+  }
+  res.status(201).json(row2obj(data));
 });
 
 // ----------------------------------------------------------------
@@ -267,24 +261,43 @@ app.patch('/api/orders/:id', async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const body = req.body || {};
 
-  const updated = await withDB((db) => {
-    const order = db.orders.find(o => o.id === id && o.store === req.storeId);
-    if (!order) return null;
+  const { data: existing, error: fetchError } = await supabase
+    .from('orders')
+    .select('id, store, data')
+    .eq('id', id)
+    .eq('store', req.storeId)
+    .maybeSingle();
 
-    if (typeof body.status === 'string') {
-      order.status = body.status;
-    }
-    if (Array.isArray(body.tags)) {
-      order.tags = body.tags;
-    }
-    if (typeof body.note === 'string' && body.note.trim()) {
-      order.notes.push({ text: body.note.trim(), time: nowHHMM() });
-    }
-    return order;
-  });
+  if (fetchError) {
+    console.error('Error buscando pedido en Supabase:', fetchError);
+    return res.status(500).json({ error: 'No se pudo buscar el pedido.' });
+  }
+  if (!existing) return res.status(404).json({ error: 'Pedido no encontrado.' });
 
-  if (!updated) return res.status(404).json({ error: 'Pedido no encontrado.' });
-  res.json(updated);
+  const orderData = { ...existing.data };
+  if (typeof body.status === 'string') {
+    orderData.status = body.status;
+  }
+  if (Array.isArray(body.tags)) {
+    orderData.tags = body.tags;
+  }
+  if (typeof body.note === 'string' && body.note.trim()) {
+    orderData.notes = [...(orderData.notes || []), { text: body.note.trim(), time: nowHHMM() }];
+  }
+
+  const { data: updated, error: updateError } = await supabase
+    .from('orders')
+    .update({ data: orderData })
+    .eq('id', id)
+    .eq('store', req.storeId)
+    .select('id, store, data')
+    .single();
+
+  if (updateError) {
+    console.error('Error actualizando pedido en Supabase:', updateError);
+    return res.status(500).json({ error: 'No se pudo actualizar el pedido.' });
+  }
+  res.json(row2obj(updated));
 });
 
 // ----------------------------------------------------------------
@@ -297,13 +310,30 @@ app.patch('/api/orders/:id', async (req, res) => {
 // :id y nunca llegaría acá.
 // ----------------------------------------------------------------
 app.delete('/api/orders/demo', async (req, res) => {
-  const deleted = await withDB((db) => {
-    const before = db.orders.length;
-    db.orders = db.orders.filter(o => !(o.demo && o.store === req.storeId));
-    return before - db.orders.length;
-  });
+  const { data: rows, error: fetchError } = await supabase
+    .from('orders')
+    .select('id, data')
+    .eq('store', req.storeId);
 
-  res.json({ ok: true, deleted });
+  if (fetchError) {
+    console.error('Error buscando pedidos demo en Supabase:', fetchError);
+    return res.status(500).json({ error: 'No se pudieron buscar los pedidos demo.' });
+  }
+
+  const idsToDelete = rows.filter(r => r.data && r.data.demo).map(r => r.id);
+  if (idsToDelete.length === 0) return res.json({ ok: true, deleted: 0 });
+
+  const { error: deleteError } = await supabase
+    .from('orders')
+    .delete()
+    .in('id', idsToDelete)
+    .eq('store', req.storeId);
+
+  if (deleteError) {
+    console.error('Error borrando pedidos demo en Supabase:', deleteError);
+    return res.status(500).json({ error: 'No se pudieron borrar los pedidos demo.' });
+  }
+  res.json({ ok: true, deleted: idsToDelete.length });
 });
 
 // ----------------------------------------------------------------
@@ -313,13 +343,18 @@ app.delete('/api/orders/demo', async (req, res) => {
 app.delete('/api/orders/:id', async (req, res) => {
   const id = parseInt(req.params.id, 10);
 
-  const existed = await withDB((db) => {
-    const before = db.orders.length;
-    db.orders = db.orders.filter(o => !(o.id === id && o.store === req.storeId));
-    return db.orders.length !== before;
-  });
+  const { data: deleted, error } = await supabase
+    .from('orders')
+    .delete()
+    .eq('id', id)
+    .eq('store', req.storeId)
+    .select('id');
 
-  if (!existed) return res.status(404).json({ error: 'Pedido no encontrado.' });
+  if (error) {
+    console.error('Error borrando pedido en Supabase:', error);
+    return res.status(500).json({ error: 'No se pudo borrar el pedido.' });
+  }
+  if (!deleted || deleted.length === 0) return res.status(404).json({ error: 'Pedido no encontrado.' });
   res.json({ ok: true });
 });
 
@@ -336,13 +371,30 @@ app.post('/api/orders/clear', async (req, res) => {
     return res.status(400).json({ error: 'Falta indicar qué estados vaciar.' });
   }
 
-  const deleted = await withDB((db) => {
-    const before = db.orders.length;
-    db.orders = db.orders.filter(o => !(o.store === req.storeId && statuses.includes(o.status)));
-    return before - db.orders.length;
-  });
+  const { data: rows, error: fetchError } = await supabase
+    .from('orders')
+    .select('id, data')
+    .eq('store', req.storeId);
 
-  res.json({ ok: true, deleted });
+  if (fetchError) {
+    console.error('Error buscando pedidos a vaciar en Supabase:', fetchError);
+    return res.status(500).json({ error: 'No se pudieron buscar los pedidos.' });
+  }
+
+  const idsToDelete = rows.filter(r => statuses.includes(r.data && r.data.status)).map(r => r.id);
+  if (idsToDelete.length === 0) return res.json({ ok: true, deleted: 0 });
+
+  const { error: deleteError } = await supabase
+    .from('orders')
+    .delete()
+    .in('id', idsToDelete)
+    .eq('store', req.storeId);
+
+  if (deleteError) {
+    console.error('Error vaciando pedidos en Supabase:', deleteError);
+    return res.status(500).json({ error: 'No se pudieron vaciar los pedidos.' });
+  }
+  res.json({ ok: true, deleted: idsToDelete.length });
 });
 
 // ================================================================
@@ -354,9 +406,18 @@ app.post('/api/orders/clear', async (req, res) => {
 // El panel (y el catálogo) lo llama al cargar la página para traer
 // el catálogo guardado de ESA tienda.
 // ----------------------------------------------------------------
-app.get('/api/products', (req, res) => {
-  const db = readProductsDB();
-  res.json(db.products.filter(p => p.store === req.storeId));
+app.get('/api/products', async (req, res) => {
+  const { data, error } = await supabase
+    .from('products')
+    .select('id, store, data')
+    .eq('store', req.storeId)
+    .order('id', { ascending: true });
+
+  if (error) {
+    console.error('Error leyendo productos de Supabase:', error);
+    return res.status(500).json({ error: 'No se pudieron leer los productos.' });
+  }
+  res.json(data.map(row2obj));
 });
 
 // ----------------------------------------------------------------
@@ -372,22 +433,39 @@ app.post('/api/products/seed', async (req, res) => {
   const body = req.body || {};
   const incoming = Array.isArray(body.products) ? body.products : [];
 
-  const result = await withProductsDB((db) => {
-    const existing = db.products.filter(p => p.store === req.storeId);
-    if (existing.length > 0) {
-      return { seeded: false, products: existing };
-    }
-    const created = incoming.map((p) => {
-      const { id, store, ...rest } = p || {}; // ignoramos id/store que mande el cliente
-      const newP = { id: db.nextId, store: req.storeId, ...rest };
-      db.nextId += 1;
-      db.products.push(newP);
-      return newP;
-    });
-    return { seeded: true, products: created };
+  const { data: existing, error: fetchError } = await supabase
+    .from('products')
+    .select('id, store, data')
+    .eq('store', req.storeId);
+
+  if (fetchError) {
+    console.error('Error chequeando catálogo existente en Supabase:', fetchError);
+    return res.status(500).json({ error: 'No se pudo chequear el catálogo.' });
+  }
+
+  if (existing.length > 0) {
+    return res.json({ seeded: false, products: existing.map(row2obj) });
+  }
+
+  const rowsToInsert = incoming.map((p) => {
+    const { id, store, ...rest } = p || {}; // ignoramos id/store que mande el cliente
+    return { store: req.storeId, data: rest };
   });
 
-  res.json(result);
+  if (rowsToInsert.length === 0) {
+    return res.json({ seeded: true, products: [] });
+  }
+
+  const { data: created, error: insertError } = await supabase
+    .from('products')
+    .insert(rowsToInsert)
+    .select('id, store, data');
+
+  if (insertError) {
+    console.error('Error sembrando catálogo en Supabase:', insertError);
+    return res.status(500).json({ error: 'No se pudo guardar el catálogo inicial.' });
+  }
+  res.json({ seeded: true, products: created.map(row2obj) });
 });
 
 // ----------------------------------------------------------------
@@ -403,14 +481,17 @@ app.post('/api/products', async (req, res) => {
 
   const { id, store, ...rest } = body; // ignoramos id/store que mande el cliente
 
-  const created = await withProductsDB((db) => {
-    const newP = { id: db.nextId, store: req.storeId, ...rest };
-    db.nextId += 1;
-    db.products.push(newP);
-    return newP;
-  });
+  const { data: created, error } = await supabase
+    .from('products')
+    .insert({ store: req.storeId, data: rest })
+    .select('id, store, data')
+    .single();
 
-  res.status(201).json(created);
+  if (error) {
+    console.error('Error creando producto en Supabase:', error);
+    return res.status(500).json({ error: 'No se pudo guardar el producto.' });
+  }
+  res.status(201).json(row2obj(created));
 });
 
 // ----------------------------------------------------------------
@@ -424,22 +505,42 @@ app.patch('/api/products/:id', async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const body = req.body || {};
 
-  const updated = await withProductsDB((db) => {
-    const p = db.products.find(x => x.id === id && x.store === req.storeId);
-    if (!p) return null;
-    Object.keys(body).forEach((key) => {
-      if (key === 'id' || key === 'store') return; // no se pueden pisar
-      if (body[key] === null) {
-        delete p[key];
-      } else {
-        p[key] = body[key];
-      }
-    });
-    return p;
+  const { data: existing, error: fetchError } = await supabase
+    .from('products')
+    .select('id, store, data')
+    .eq('id', id)
+    .eq('store', req.storeId)
+    .maybeSingle();
+
+  if (fetchError) {
+    console.error('Error buscando producto en Supabase:', fetchError);
+    return res.status(500).json({ error: 'No se pudo buscar el producto.' });
+  }
+  if (!existing) return res.status(404).json({ error: 'Producto no encontrado.' });
+
+  const productData = { ...existing.data };
+  Object.keys(body).forEach((key) => {
+    if (key === 'id' || key === 'store') return; // no se pueden pisar
+    if (body[key] === null) {
+      delete productData[key];
+    } else {
+      productData[key] = body[key];
+    }
   });
 
-  if (!updated) return res.status(404).json({ error: 'Producto no encontrado.' });
-  res.json(updated);
+  const { data: updated, error: updateError } = await supabase
+    .from('products')
+    .update({ data: productData })
+    .eq('id', id)
+    .eq('store', req.storeId)
+    .select('id, store, data')
+    .single();
+
+  if (updateError) {
+    console.error('Error actualizando producto en Supabase:', updateError);
+    return res.status(500).json({ error: 'No se pudo actualizar el producto.' });
+  }
+  res.json(row2obj(updated));
 });
 
 // ----------------------------------------------------------------
@@ -449,13 +550,18 @@ app.patch('/api/products/:id', async (req, res) => {
 app.delete('/api/products/:id', async (req, res) => {
   const id = parseInt(req.params.id, 10);
 
-  const existed = await withProductsDB((db) => {
-    const before = db.products.length;
-    db.products = db.products.filter(p => !(p.id === id && p.store === req.storeId));
-    return db.products.length !== before;
-  });
+  const { data: deleted, error } = await supabase
+    .from('products')
+    .delete()
+    .eq('id', id)
+    .eq('store', req.storeId)
+    .select('id');
 
-  if (!existed) return res.status(404).json({ error: 'Producto no encontrado.' });
+  if (error) {
+    console.error('Error borrando producto en Supabase:', error);
+    return res.status(500).json({ error: 'No se pudo borrar el producto.' });
+  }
+  if (!deleted || deleted.length === 0) return res.status(404).json({ error: 'Producto no encontrado.' });
   res.json({ ok: true });
 });
 
@@ -464,4 +570,5 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.listen(PORT, () => {
   console.log(`Backend de pedidos corriendo en el puerto ${PORT}`);
 });
+
 
