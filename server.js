@@ -20,6 +20,16 @@
 //   DELETE /api/orders/:id        -> borra un pedido puntual
 //   DELETE /api/orders/demo       -> borra los pedidos de la demo de ESA tienda
 //   POST   /api/orders/clear      -> vacía pedidos por estado, de ESA tienda
+//
+//   GET    /api/products          -> lista el catálogo de ESA tienda
+//   POST   /api/products/seed     -> carga el catálogo inicial (solo si la
+//                                     tienda todavía no tiene productos
+//                                     guardados; no duplica si se llama de nuevo)
+//   POST   /api/products          -> crea un producto nuevo
+//   PATCH  /api/products/:id      -> edita cualquier campo del producto
+//                                     (precio, oferta, agotado, foto, etc.)
+//   DELETE /api/products/:id      -> borra un producto puntual
+//
 //   GET    /api/health            -> chequeo simple de que el server vive
 // ================================================================
 
@@ -31,6 +41,7 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DB_FILE = path.join(__dirname, 'orders.json');
+const PRODUCTS_FILE = path.join(__dirname, 'products.json');
 const STORES_FILE = path.join(__dirname, 'stores.json');
 
 // ----------------------------------------------------------------
@@ -94,8 +105,10 @@ function requireStore(req, res, next) {
   next();
 }
 
-// Todos los endpoints de /api/orders* requieren identificar la tienda.
+// Todos los endpoints de /api/orders* y /api/products* requieren
+// identificar la tienda.
 app.use('/api/orders', requireStore);
+app.use('/api/products', requireStore);
 
 // ----------------------------------------------------------------
 // Persistencia muy simple en un archivo JSON.
@@ -131,6 +144,38 @@ function withDB(mutatorFn) {
     return result;
   });
   return writeQueue;
+}
+
+// ----------------------------------------------------------------
+// Persistencia de PRODUCTOS (catálogo), en un archivo aparte
+// (products.json) pero con la misma lógica que orders.json: cada
+// producto queda etiquetado con "store" y todo se filtra por ahí.
+// ----------------------------------------------------------------
+function readProductsDB() {
+  if (!fs.existsSync(PRODUCTS_FILE)) {
+    return { nextId: 1, products: [] };
+  }
+  try {
+    return JSON.parse(fs.readFileSync(PRODUCTS_FILE, 'utf8'));
+  } catch (e) {
+    console.error('Error leyendo products.json, arranco desde cero:', e);
+    return { nextId: 1, products: [] };
+  }
+}
+
+function writeProductsDB(db) {
+  fs.writeFileSync(PRODUCTS_FILE, JSON.stringify(db, null, 2));
+}
+
+let productsWriteQueue = Promise.resolve();
+function withProductsDB(mutatorFn) {
+  productsWriteQueue = productsWriteQueue.then(() => {
+    const db = readProductsDB();
+    const result = mutatorFn(db);
+    writeProductsDB(db);
+    return result;
+  });
+  return productsWriteQueue;
 }
 
 function nowHHMM() {
@@ -298,6 +343,120 @@ app.post('/api/orders/clear', async (req, res) => {
   });
 
   res.json({ ok: true, deleted });
+});
+
+// ================================================================
+// PRODUCTOS (catálogo)
+// ================================================================
+
+// ----------------------------------------------------------------
+// GET /api/products
+// El panel (y el catálogo) lo llama al cargar la página para traer
+// el catálogo guardado de ESA tienda.
+// ----------------------------------------------------------------
+app.get('/api/products', (req, res) => {
+  const db = readProductsDB();
+  res.json(db.products.filter(p => p.store === req.storeId));
+});
+
+// ----------------------------------------------------------------
+// POST /api/products/seed
+// Carga el catálogo inicial (el que viene escrito en el HTML) la
+// PRIMERA vez que una tienda entra al panel. Si esa tienda ya tiene
+// productos guardados, no hace nada y devuelve los que ya existen
+// — así se puede llamar sin miedo cada vez que carga la página, sin
+// riesgo de duplicar productos.
+// Body esperado: { products: [ {cat, name, price, ...}, ... ] }
+// ----------------------------------------------------------------
+app.post('/api/products/seed', async (req, res) => {
+  const body = req.body || {};
+  const incoming = Array.isArray(body.products) ? body.products : [];
+
+  const result = await withProductsDB((db) => {
+    const existing = db.products.filter(p => p.store === req.storeId);
+    if (existing.length > 0) {
+      return { seeded: false, products: existing };
+    }
+    const created = incoming.map((p) => {
+      const { id, store, ...rest } = p || {}; // ignoramos id/store que mande el cliente
+      const newP = { id: db.nextId, store: req.storeId, ...rest };
+      db.nextId += 1;
+      db.products.push(newP);
+      return newP;
+    });
+    return { seeded: true, products: created };
+  });
+
+  res.json(result);
+});
+
+// ----------------------------------------------------------------
+// POST /api/products
+// Crea un producto nuevo (lo usa el botón "Agregar producto" del panel).
+// Body esperado: { cat, name, price, offerPrice?, outOfStock?, img?, ... }
+// ----------------------------------------------------------------
+app.post('/api/products', async (req, res) => {
+  const body = req.body || {};
+  if (!body.name || typeof body.price === 'undefined') {
+    return res.status(400).json({ error: 'Falta nombre o precio del producto.' });
+  }
+
+  const { id, store, ...rest } = body; // ignoramos id/store que mande el cliente
+
+  const created = await withProductsDB((db) => {
+    const newP = { id: db.nextId, store: req.storeId, ...rest };
+    db.nextId += 1;
+    db.products.push(newP);
+    return newP;
+  });
+
+  res.status(201).json(created);
+});
+
+// ----------------------------------------------------------------
+// PATCH /api/products/:id
+// Edita cualquier campo del producto (precio, oferta, agotado, foto,
+// nombre, categoría, etc.). Mandá solo los campos que querés cambiar.
+// Para BORRAR un campo (ej: sacar la oferta o la foto), mandalo en
+// null: { "offerPrice": null } elimina offerPrice del producto.
+// ----------------------------------------------------------------
+app.patch('/api/products/:id', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const body = req.body || {};
+
+  const updated = await withProductsDB((db) => {
+    const p = db.products.find(x => x.id === id && x.store === req.storeId);
+    if (!p) return null;
+    Object.keys(body).forEach((key) => {
+      if (key === 'id' || key === 'store') return; // no se pueden pisar
+      if (body[key] === null) {
+        delete p[key];
+      } else {
+        p[key] = body[key];
+      }
+    });
+    return p;
+  });
+
+  if (!updated) return res.status(404).json({ error: 'Producto no encontrado.' });
+  res.json(updated);
+});
+
+// ----------------------------------------------------------------
+// DELETE /api/products/:id
+// Elimina un producto puntual (lo usa el botón "Eliminar" del panel).
+// ----------------------------------------------------------------
+app.delete('/api/products/:id', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+
+  const existed = await withProductsDB((db) => {
+    const before = db.products.length;
+    db.products = db.products.filter(p => !(p.id === id && p.store === req.storeId));
+    return db.products.length !== before;
+  });
+
+  if (!existed) return res.status(404).json({ error: 'Producto no encontrado.' });
+  res.json({ ok: true });
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
