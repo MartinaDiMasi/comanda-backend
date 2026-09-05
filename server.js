@@ -38,6 +38,8 @@
 //   POST   /api/products          -> crea un producto nuevo
 //   PATCH  /api/products/:id      -> edita cualquier campo del producto
 //                                     (precio, oferta, agotado, foto, etc.)
+//   POST   /api/products/:id/image -> sube una foto (base64) a Supabase
+//                                     Storage y guarda su URL en el producto
 //   DELETE /api/products/:id      -> borra un producto puntual
 //
 //   GET    /api/health            -> chequeo simple de que el server vive
@@ -83,6 +85,57 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+
+// ----------------------------------------------------------------
+// SUPABASE STORAGE — fotos de productos
+// ----------------------------------------------------------------
+// Antes las fotos se guardaban como texto base64 adentro del mismo
+// jsonb del producto: eso hacía que GET /api/products devolviera TODO
+// el catálogo con TODAS las fotos incrustadas en una sola respuesta
+// gigante, sin importar qué categoría estuviera mirando el cliente.
+// Con más de unos pocos productos con foto, esa respuesta se vuelve
+// pesadísima y tarda mucho en llegar.
+//
+// Ahora las fotos se suben a un bucket de Supabase Storage y en el
+// producto solo se guarda la URL pública (un texto cortito). Así:
+//   - GET /api/products queda liviano siempre, tenga el catálogo 20
+//     o 2000 productos.
+//   - El navegador pide cada foto por separado, en paralelo, y las
+//     cachea de verdad entre visitas (cosa que no pasaba con el
+//     base64 embebido).
+//   - El atributo loading="lazy" que ya tiene el catálogo empieza a
+//     servir de verdad: ahora si una foto no se ve en pantalla, ni
+//     siquiera se descarga.
+// ----------------------------------------------------------------
+const PRODUCT_IMAGES_BUCKET = 'product-images';
+
+async function ensureProductImagesBucket() {
+  try {
+    const { data: buckets, error } = await supabase.storage.listBuckets();
+    if (error) {
+      console.error('No se pudieron listar los buckets de Supabase Storage:', error);
+      return;
+    }
+    const exists = (buckets || []).some((b) => b.name === PRODUCT_IMAGES_BUCKET);
+    if (exists) return;
+
+    const { error: createError } = await supabase.storage.createBucket(PRODUCT_IMAGES_BUCKET, {
+      public: true, // tiene que ser público para que las fotos se puedan mostrar en el catálogo sin autenticación
+    });
+    if (createError) {
+      console.error(
+        `No se pudo crear el bucket "${PRODUCT_IMAGES_BUCKET}" automáticamente. ` +
+        'Podés crearlo a mano en Supabase -> Storage -> New bucket (marcá "Public bucket"). Detalle:',
+        createError
+      );
+    } else {
+      console.log(`Bucket "${PRODUCT_IMAGES_BUCKET}" creado en Supabase Storage.`);
+    }
+  } catch (e) {
+    console.error('Error asegurando el bucket de imágenes de productos:', e);
+  }
+}
+ensureProductImagesBucket();
 
 // ----------------------------------------------------------------
 // MULTI-TENANCY
@@ -544,6 +597,77 @@ app.patch('/api/products/:id', async (req, res) => {
 });
 
 // ----------------------------------------------------------------
+// POST /api/products/:id/image
+// Sube la foto de un producto a Supabase Storage y guarda en el
+// producto la URL pública resultante (no el base64). El frontend ya
+// redimensiona/comprime la foto antes de mandarla acá (ver
+// resizeImageToDataURL en el catálogo), así que este endpoint solo
+// se encarga de subirla y de reemplazar el campo "img".
+// Body esperado: { dataUrl: "data:image/jpeg;base64,...." }
+// ----------------------------------------------------------------
+app.post('/api/products/:id/image', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const { dataUrl } = req.body || {};
+
+  const match = typeof dataUrl === 'string'
+    && dataUrl.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/);
+  if (!match) {
+    return res.status(400).json({ error: 'Falta o es inválida la imagen (dataUrl).' });
+  }
+  const mime = match[1];
+  const ext = (mime.split('/')[1] || 'jpg').split('+')[0];
+  const buffer = Buffer.from(match[2], 'base64');
+
+  // Ruta separada por tienda, para que las fotos de un comercio nunca
+  // se mezclen ni se puedan pisar con las de otro.
+  const filePath = `${req.storeId}/${id}-${Date.now()}.${ext}`;
+
+  const { error: uploadError } = await supabase.storage
+    .from(PRODUCT_IMAGES_BUCKET)
+    .upload(filePath, buffer, { contentType: mime, upsert: true });
+
+  if (uploadError) {
+    console.error('Error subiendo imagen a Supabase Storage:', uploadError);
+    return res.status(500).json({ error: 'No se pudo subir la imagen.' });
+  }
+
+  const { data: publicUrlData } = supabase.storage
+    .from(PRODUCT_IMAGES_BUCKET)
+    .getPublicUrl(filePath);
+  const imageUrl = publicUrlData.publicUrl;
+
+  const { data: existing, error: fetchError } = await supabase
+    .from('products')
+    .select('id, store, data')
+    .eq('id', id)
+    .eq('store', req.storeId)
+    .maybeSingle();
+
+  if (fetchError) {
+    console.error('Error buscando producto en Supabase:', fetchError);
+    return res.status(500).json({ error: 'No se pudo buscar el producto.' });
+  }
+  if (!existing) return res.status(404).json({ error: 'Producto no encontrado.' });
+
+  const productData = { ...existing.data, img: imageUrl };
+
+  const { data: updated, error: updateError } = await supabase
+    .from('products')
+    .update({ data: productData })
+    .eq('id', id)
+    .eq('store', req.storeId)
+    .select('id, store, data')
+    .single();
+
+  if (updateError) {
+    console.error('Error guardando la URL de la imagen en el producto:', updateError);
+    return res.status(500).json({ error: 'No se pudo actualizar el producto con la nueva foto.' });
+  }
+
+  res.json(row2obj(updated));
+});
+
+// ----------------------------------------------------------------
 // DELETE /api/products/:id
 // Elimina un producto puntual (lo usa el botón "Eliminar" del panel).
 // ----------------------------------------------------------------
@@ -570,5 +694,6 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.listen(PORT, () => {
   console.log(`Backend de pedidos corriendo en el puerto ${PORT}`);
 });
+
 
 
