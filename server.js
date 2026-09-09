@@ -42,6 +42,11 @@
 //                                     Storage y guarda su URL en el producto
 //   DELETE /api/products/:id      -> borra un producto puntual
 //
+//   GET    /api/settings          -> trae nombre del negocio, WhatsApp y
+//                                     alias de transferencia de ESA tienda
+//   PATCH  /api/settings          -> guarda cambios en esos datos (mandá
+//                                     solo los campos que querés actualizar)
+//
 //   GET    /api/health            -> chequeo simple de que el server vive
 // ================================================================
 
@@ -184,10 +189,11 @@ function requireStore(req, res, next) {
   next();
 }
 
-// Todos los endpoints de /api/orders* y /api/products* requieren
-// identificar la tienda.
+// Todos los endpoints de /api/orders*, /api/products* y /api/settings
+// requieren identificar la tienda.
 app.use('/api/orders', requireStore);
 app.use('/api/products', requireStore);
+app.use('/api/settings', requireStore);
 
 // ----------------------------------------------------------------
 // Persistencia en Supabase.
@@ -689,11 +695,68 @@ app.delete('/api/products/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ----------------------------------------------------------------
+// GET /api/settings
+// Trae los datos generales del negocio (nombre, WhatsApp, alias de
+// transferencia) de ESTA tienda. Si todavía no guardó nada (primera
+// vez), devuelve un objeto vacío: el frontend se queda con los
+// valores que ya trae fijos en el HTML.
+// ----------------------------------------------------------------
+app.get('/api/settings', async (req, res) => {
+  const { data, error } = await supabase
+    .from('settings')
+    .select('data')
+    .eq('store', req.storeId)
+    .maybeSingle();
+
+  if (error) {
+    console.error('Error leyendo datos del negocio en Supabase:', error);
+    return res.status(500).json({ error: 'No se pudieron leer los datos del negocio.' });
+  }
+  res.json((data && data.data) || {});
+});
+
+// ----------------------------------------------------------------
+// PATCH /api/settings
+// Guarda cambios en los datos generales del negocio (lo usa la
+// pestaña "Datos" del panel). Mandá solo los campos que querés
+// actualizar, por ejemplo: { "storeName": "Nuevo nombre" }.
+// Body esperado (todos opcionales): { storeName?, whatsapp?, alias? }
+// ----------------------------------------------------------------
+app.patch('/api/settings', async (req, res) => {
+  const body = req.body || {};
+
+  const { data: existing, error: fetchError } = await supabase
+    .from('settings')
+    .select('data')
+    .eq('store', req.storeId)
+    .maybeSingle();
+
+  if (fetchError) {
+    console.error('Error buscando datos del negocio en Supabase:', fetchError);
+    return res.status(500).json({ error: 'No se pudieron leer los datos del negocio.' });
+  }
+
+  const merged = { ...((existing && existing.data) || {}), ...body };
+  delete merged.store; // no se puede pisar la clave de la tienda
+
+  const { data: upserted, error: upsertError } = await supabase
+    .from('settings')
+    .upsert({ store: req.storeId, data: merged, updated_at: new Date().toISOString() }, { onConflict: 'store' })
+    .select('data')
+    .single();
+
+  if (upsertError) {
+    console.error('Error guardando datos del negocio en Supabase:', upsertError);
+    return res.status(500).json({ error: 'No se pudieron guardar los datos del negocio.' });
+  }
+  res.json(upserted.data);
+});
+
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => {
   console.log(`Backend de pedidos corriendo en el puerto ${PORT}`);
 });
-
 
 
