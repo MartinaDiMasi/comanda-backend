@@ -466,17 +466,27 @@ app.post('/api/orders/clear', async (req, res) => {
 // el catálogo guardado de ESA tienda.
 // ----------------------------------------------------------------
 app.get('/api/products', async (req, res) => {
-  const { data, error } = await supabase
-    .from('products')
-    .select('id, store, data')
-    .eq('store', req.storeId)
-    .order('id', { ascending: true });
+  // Supabase devuelve como máximo 1000 filas por consulta. Si no se
+  // pagina, los productos con id más alto (los últimos cargados)
+  // quedan afuera sin ningún error. Por eso se lee de a páginas.
+  const PAGE = 1000;
+  let all = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase
+      .from('products')
+      .select('id, store, data')
+      .eq('store', req.storeId)
+      .order('id', { ascending: true })
+      .range(from, from + PAGE - 1);
 
-  if (error) {
-    console.error('Error leyendo productos de Supabase:', error);
-    return res.status(500).json({ error: 'No se pudieron leer los productos.' });
+    if (error) {
+      console.error('Error leyendo productos de Supabase:', error);
+      return res.status(500).json({ error: 'No se pudieron leer los productos.' });
+    }
+    all = all.concat(data);
+    if (data.length < PAGE) break;
   }
-  res.json(data.map(row2obj));
+  res.json(all.map(row2obj));
 });
 
 // ----------------------------------------------------------------
@@ -758,5 +768,4 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.listen(PORT, () => {
   console.log(`Backend de pedidos corriendo en el puerto ${PORT}`);
 });
-
 
