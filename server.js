@@ -152,9 +152,25 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 app.use('/api', requireStore);
 
+// Supabase corta cada consulta en 1000 filas. Para no perder productos
+// (los últimos cargados quedaban afuera), se leen por páginas hasta
+// traerlos todos.
+async function fetchAllRows(table, storeId, ascending) {
+  const PAGE = 1000;
+  let all = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase.from(table).select('id, store, data')
+      .eq('store', storeId).order('id', { ascending })
+      .range(from, from + PAGE - 1);
+    if (error) return { error };
+    all = all.concat(data);
+    if (data.length < PAGE) break;
+  }
+  return { data: all };
+}
+
 app.get('/api/products', async (req, res) => {
-  const { data, error } = await supabase.from('products').select('id, store, data')
-    .eq('store', req.storeId).order('id', { ascending: true });
+  const { data, error } = await fetchAllRows('products', req.storeId, true);
   if (error) return dbError(res, 'No se pudieron leer los productos.', error);
   res.json(data.map(row2obj));
 });
@@ -277,8 +293,7 @@ app.post('/api/admin/password', requireAdmin, async (req, res) => {
 
 // ---- Pedidos ----
 app.get('/api/orders', requireAdmin, async (req, res) => {
-  const { data, error } = await supabase.from('orders').select('id, store, data')
-    .eq('store', req.storeId).order('id', { ascending: false });
+  const { data, error } = await fetchAllRows('orders', req.storeId, false);
   if (error) return dbError(res, 'No se pudieron leer los pedidos.', error);
   res.json(data.map(row2obj));
 });
@@ -456,3 +471,4 @@ app.patch('/api/settings', requireAdmin, async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Backend de pedidos corriendo en el puerto ${PORT}`));
+
