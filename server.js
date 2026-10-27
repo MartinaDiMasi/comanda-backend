@@ -230,13 +230,47 @@ app.post('/api/orders', async (req, res) => {
 // ================================================================
 // ADMIN
 // ================================================================
-app.post('/api/admin/login', (req, res) => {
+// El hash vigente es el que el dueño guardó al cambiar su contraseña (tabla settings);
+// si nunca la cambió, vale el de stores.json (la contraseña temporal).
+async function getAdminHash(storeId, cfg) {
+  try {
+    const { data } = await supabase.from('settings').select('data').eq('store', storeId).maybeSingle();
+    if (data && data.data && data.data.adminPasswordHash) return data.data.adminPasswordHash;
+  } catch (e) { console.error('No se pudo leer el hash de la base, se usa stores.json:', e.message); }
+  return cfg.adminPasswordHash;
+}
+const hashPassword = (pwd) => {
+  const salt = crypto.randomBytes(16).toString('hex');
+  return `scrypt$${salt}$${crypto.scryptSync(String(pwd), salt, 64).toString('hex')}`;
+};
+
+app.post('/api/admin/login', async (req, res) => {
   const k = `${req.ip}|${req.storeId}`;
   if (loginLimiter.blocked(k)) return res.status(429).json({ error: 'Demasiados intentos. Esperá 15 minutos.' });
-  const ok = verifyPassword((req.body || {}).password || '', req.storeCfg.adminPasswordHash);
-  if (!ok) { loginLimiter.hit(k); return res.status(401).json({ error: 'Contraseña incorrecta.' }); }
+  const hash = await getAdminHash(req.storeId, req.storeCfg);
+  if (!verifyPassword((req.body || {}).password || '', hash)) { loginLimiter.hit(k); return res.status(401).json({ error: 'Contraseña incorrecta.' }); }
   loginLimiter.clear(k);
   res.json({ token: issueToken(req.storeId), expiresInMs: SESSION_TTL_MS });
+});
+
+// Cambiar la contraseña (la elige el dueño; nadie más la ve).
+app.post('/api/admin/password', requireAdmin, async (req, res) => {
+  const k = `pwd|${req.ip}|${req.storeId}`;
+  if (loginLimiter.blocked(k)) return res.status(429).json({ error: 'Demasiados intentos. Esperá 15 minutos.' });
+  const { current, next } = req.body || {};
+  if (typeof next !== 'string' || next.length < 10 || next.length > 200) {
+    return res.status(400).json({ error: 'La contraseña nueva tiene que tener al menos 10 caracteres.' });
+  }
+  const hash = await getAdminHash(req.storeId, req.storeCfg);
+  if (!verifyPassword(current || '', hash)) { loginLimiter.hit(k); return res.status(401).json({ error: 'La contraseña actual no es correcta.' }); }
+  const { data: existing, error: fErr } = await supabase.from('settings').select('data').eq('store', req.storeId).maybeSingle();
+  if (fErr) return dbError(res, 'No se pudo cambiar la contraseña.', fErr);
+  const merged = { ...((existing && existing.data) || {}), adminPasswordHash: hashPassword(next) };
+  const { error: uErr } = await supabase.from('settings')
+    .upsert({ store: req.storeId, data: merged, updated_at: new Date().toISOString() }, { onConflict: 'store' });
+  if (uErr) return dbError(res, 'No se pudo cambiar la contraseña.', uErr);
+  loginLimiter.clear(k);
+  res.json({ ok: true });
 });
 
 // Todo lo que sigue exige sesión de admin (middleware requireAdmin).
@@ -411,12 +445,14 @@ app.patch('/api/settings', requireAdmin, async (req, res) => {
   if (fErr) return dbError(res, 'No se pudieron leer los datos del negocio.', fErr);
   const merged = { ...((existing && existing.data) || {}), ...body };
   delete merged.store;
+  if (existing && existing.data && existing.data.adminPasswordHash) merged.adminPasswordHash = existing.data.adminPasswordHash;
+  else delete merged.adminPasswordHash;
   const { data: up, error: uErr } = await supabase.from('settings')
     .upsert({ store: req.storeId, data: merged, updated_at: new Date().toISOString() }, { onConflict: 'store' })
     .select('data').single();
   if (uErr) return dbError(res, 'No se pudieron guardar los datos del negocio.', uErr);
-  res.json(up.data);
+  const { adminPasswordHash, ...safe } = up.data;
+  res.json(safe);
 });
 
 app.listen(PORT, () => console.log(`Backend de pedidos corriendo en el puerto ${PORT}`));
-
