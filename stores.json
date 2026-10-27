@@ -1,6 +1,18 @@
 {
-  "y9k-at5c6L5PXW50x8eJaYk4SPjZVwSq": "cliente-estandar-demo",
-  "dSxH0arUPzy2byfSowUlVrk4jzOAz0lW": "origen-almacen-natural",
-  "EQSwoyl6D6KNUzJfGD7qZ2mZtKz2M3Ek": "cliente-premium-demo-2",
-  "owWunLr45YPqCYlgDGQNgUIndf5d6I4o": "barrica-sanjuan"
+  "cliente-estandar-demo": {
+    "publicKey": "o3G_tHk6fgsx-0zVB9HU2BmHdLTldRtx",
+    "adminPasswordHash": "scrypt$6a66349339aa0aa793cc21687e3d8de0$4ca06407f81d012a747b971a79d3a245142ec24bc3a3bbd9ccaf6b4a4a2066c8537cf2c16f672c9accbbfd08dd1de56061b6e23079ed704f23294fba10ba29e6"
+  },
+  "origen-almacen-natural": {
+    "publicKey": "Ac-5tUnQIOgUni78S4yEC6N5Hih6UUU5",
+    "adminPasswordHash": "scrypt$fd5dd84445c239eb07b453bb3b608e50$0997f2553aa1cce4383b48f71ed831066f2b958a09d4e7d20a2e356cac8e019363ad7dde9fffd75fb895422e1ec3d9474f763faa13cab0ba87b94a0a9a7d588f"
+  },
+  "cliente-premium-demo-2": {
+    "publicKey": "8p7vc_FwD6TzdwivGJLHOjZZrdannZpv",
+    "adminPasswordHash": "scrypt$028361ab5d8bbc61390b94a7cfe9d47c$957d1cdbeb563dd60fe582a683e9f436eaf490b1d4b6461f2625efb4d1ed3e0ec06878aa898d1a3b421697c3ca3d24d56af71d2f127c3633b1a77f2468bddf7f"
+  },
+  "barrica-sanjuan": {
+    "publicKey": "ST7O2pfZIoyXWiOWfTMe-9LlJG6gSCy5",
+    "adminPasswordHash": "scrypt$2a09ca2228daf30abce263fedd3961c7$32b1483fb9b9a6b04ca3857b0b70c4627f6145a80250523f30b7315178ebd28464c293bfd47f58ce582b421d431f27571a98a4816e26d423c789b9e6480f5cec"
+  }
 }
