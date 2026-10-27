@@ -1,771 +1,422 @@
 // ================================================================
-// BACKEND — Centro de pedidos "Comanda"
+// BACKEND — "Comanda" (pedidos + catálogo) con Supabase
 // ----------------------------------------------------------------
-// Guarda los pedidos y el catálogo en Supabase (Postgres) y los
-// expone por una API REST. El panel de control los consulta cada
-// pocos segundos (polling) para enterarse de pedidos nuevos.
+// DOS NIVELES DE ACCESO (por tienda, ver stores.json):
 //
-// POR QUÉ SUPABASE Y NO ARCHIVOS JSON EN DISCO:
-// Este backend corre en un plan gratuito de Render, que tiene el
-// filesystem efímero: cualquier archivo que el server escriba en
-// disco (como antes orders.json / products.json) se BORRA cada vez
-// que el servicio se reinicia — y eso pasa solo, cada vez que Render
-// "duerme" el servicio por inactividad y luego lo despierta. Guardar
-// los datos en Supabase en vez de en disco evita ese problema: los
-// datos viven en la base, no en el contenedor.
+//  1) CLAVE PÚBLICA (header X-Store-Key) — va dentro de index.html.
+//     Solo permite:
+//       GET  /api/products   leer el catálogo
+//       GET  /api/settings   leer nombre, WhatsApp y alias (solo esos)
+//       POST /api/orders     crear un pedido. El servidor ignora los
+//                            precios que mande el navegador y usa los
+//                            de la base de datos.
 //
-// MULTI-TENANCY: este backend puede atender a varios comercios a la
-// vez. Cada request tiene que identificar la tienda con el header
-// "X-Store-Key" (ver stores.json y la función requireStore más abajo).
-// Sin esa clave, ningún endpoint de /api/orders ni /api/products
-// responde. Cada fila queda etiquetada con su "store" (columna
-// "store"), y todas las lecturas/escrituras se filtran por esa
-// columna, así los datos de una tienda nunca se mezclan ni son
-// visibles desde otra.
+//  2) ADMIN (X-Store-Key + "Authorization: Bearer <token>") — el token
+//     se obtiene con POST /api/admin/login {password}. La contraseña
+//     nunca está en ningún HTML ni en el repo (solo su hash en
+//     stores.json). Todo lo demás exige este token:
+//       GET/PATCH/DELETE /api/orders..., POST /api/orders/demo|clear,
+//       POST/PATCH/DELETE /api/products..., POST /api/products/seed,
+//       POST /api/products/:id/image, PATCH /api/settings
 //
-// Endpoints (todos requieren header X-Store-Key salvo /api/health):
-//   GET    /api/orders            -> lista los pedidos de ESA tienda
-//   POST   /api/orders            -> crea un pedido nuevo (lo usa la tienda)
-//   PATCH  /api/orders/:id        -> actualiza status / tags / agrega nota
-//   DELETE /api/orders/:id        -> borra un pedido puntual
-//   DELETE /api/orders/demo       -> borra los pedidos de la demo de ESA tienda
-//   POST   /api/orders/clear      -> vacía pedidos por estado, de ESA tienda
-//
-//   GET    /api/products          -> lista el catálogo de ESA tienda
-//   POST   /api/products/seed     -> carga el catálogo inicial (solo si la
-//                                     tienda todavía no tiene productos
-//                                     guardados; no duplica si se llama de nuevo)
-//   POST   /api/products          -> crea un producto nuevo
-//   PATCH  /api/products/:id      -> edita cualquier campo del producto
-//                                     (precio, oferta, agotado, foto, etc.)
-//   POST   /api/products/:id/image -> sube una foto (base64) a Supabase
-//                                     Storage y guarda su URL en el producto
-//   DELETE /api/products/:id      -> borra un producto puntual
-//
-//   GET    /api/settings          -> trae nombre del negocio, WhatsApp y
-//                                     alias de transferencia de ESA tienda
-//   PATCH  /api/settings          -> guarda cambios en esos datos (mandá
-//                                     solo los campos que querés actualizar)
-//
-//   GET    /api/health            -> chequeo simple de que el server vive
+// Variables de entorno: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+// ALLOWED_ORIGIN (dominios de la tienda y del admin, separados por
+// coma), SESSION_SECRET (opcional pero recomendada).
 // ================================================================
 
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
+app.set('trust proxy', 1); // Render va detrás de un proxy: así req.ip es la IP real
 const PORT = process.env.PORT || 3000;
 const STORES_FILE = path.join(__dirname, 'stores.json');
 
-// ----------------------------------------------------------------
-// CORS: en producción, reemplazá el '*' por el/los dominios reales
-// de tus tiendas (ej: "https://mi-comercio.com") para que solo esas
-// páginas puedan mandar pedidos a este backend.
-// ----------------------------------------------------------------
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
-app.use(cors({ origin: ALLOWED_ORIGIN }));
-app.use(express.json({ limit: '5mb' })); // límite más alto: los productos pueden traer fotos en base64
-
-// ----------------------------------------------------------------
-// CONEXIÓN A SUPABASE
-// ----------------------------------------------------------------
-// SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY salen del panel de tu
-// proyecto en Supabase (Project Settings -> API) y se configuran
-// como variables de entorno en Render (nunca hardcodeadas acá).
-// Usamos la "service role key" (no la "anon key") porque este
-// backend es el único que habla con la base, y él mismo ya se ocupa
-// de separar los datos por tienda con requireStore/X-Store-Key.
-// ----------------------------------------------------------------
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-  console.error(
-    'ATENCIÓN: faltan las variables de entorno SUPABASE_URL y/o ' +
-    'SUPABASE_SERVICE_ROLE_KEY. El backend no va a poder leer ni ' +
-    'guardar pedidos ni productos. Configuralas en Render (Environment).'
-  );
+// ---------------- CORS ----------------
+// ALLOWED_ORIGIN="https://tienda.com,https://admin.tienda.com"
+const allowed = (process.env.ALLOWED_ORIGIN || '*').split(',').map(s => s.trim()).filter(Boolean);
+if (allowed.includes('*')) {
+  console.warn('ATENCIÓN: ALLOWED_ORIGIN no está configurado, el CORS queda abierto (*). Poné los dominios reales en Render.');
 }
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+app.use(cors({
+  origin: allowed.includes('*') ? '*' : (origin, cb) => cb(null, !origin || allowed.includes(origin)),
+}));
+app.use(express.json({ limit: '5mb' }));
 
-// ----------------------------------------------------------------
-// SUPABASE STORAGE — fotos de productos
-// ----------------------------------------------------------------
-// Antes las fotos se guardaban como texto base64 adentro del mismo
-// jsonb del producto: eso hacía que GET /api/products devolviera TODO
-// el catálogo con TODAS las fotos incrustadas en una sola respuesta
-// gigante, sin importar qué categoría estuviera mirando el cliente.
-// Con más de unos pocos productos con foto, esa respuesta se vuelve
-// pesadísima y tarda mucho en llegar.
-//
-// Ahora las fotos se suben a un bucket de Supabase Storage y en el
-// producto solo se guarda la URL pública (un texto cortito). Así:
-//   - GET /api/products queda liviano siempre, tenga el catálogo 20
-//     o 2000 productos.
-//   - El navegador pide cada foto por separado, en paralelo, y las
-//     cachea de verdad entre visitas (cosa que no pasaba con el
-//     base64 embebido).
-//   - El atributo loading="lazy" que ya tiene el catálogo empieza a
-//     servir de verdad: ahora si una foto no se ve en pantalla, ni
-//     siquiera se descarga.
-// ----------------------------------------------------------------
+// ---------------- Supabase ----------------
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('ATENCIÓN: faltan SUPABASE_URL y/o SUPABASE_SERVICE_ROLE_KEY.');
+}
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
 const PRODUCT_IMAGES_BUCKET = 'product-images';
-
-async function ensureProductImagesBucket() {
+(async function ensureBucket() {
   try {
     const { data: buckets, error } = await supabase.storage.listBuckets();
-    if (error) {
-      console.error('No se pudieron listar los buckets de Supabase Storage:', error);
-      return;
-    }
-    const exists = (buckets || []).some((b) => b.name === PRODUCT_IMAGES_BUCKET);
-    if (exists) return;
+    if (error) return console.error('No se pudieron listar los buckets:', error);
+    if ((buckets || []).some(b => b.name === PRODUCT_IMAGES_BUCKET)) return;
+    const { error: e2 } = await supabase.storage.createBucket(PRODUCT_IMAGES_BUCKET, { public: true });
+    if (e2) console.error('No se pudo crear el bucket product-images (crealo a mano, público):', e2);
+  } catch (e) { console.error('Error con el bucket de imágenes:', e); }
+})();
 
-    const { error: createError } = await supabase.storage.createBucket(PRODUCT_IMAGES_BUCKET, {
-      public: true, // tiene que ser público para que las fotos se puedan mostrar en el catálogo sin autenticación
-    });
-    if (createError) {
-      console.error(
-        `No se pudo crear el bucket "${PRODUCT_IMAGES_BUCKET}" automáticamente. ` +
-        'Podés crearlo a mano en Supabase -> Storage -> New bucket (marcá "Public bucket"). Detalle:',
-        createError
-      );
-    } else {
-      console.log(`Bucket "${PRODUCT_IMAGES_BUCKET}" creado en Supabase Storage.`);
-    }
-  } catch (e) {
-    console.error('Error asegurando el bucket de imágenes de productos:', e);
-  }
-}
-ensureProductImagesBucket();
-
-// ----------------------------------------------------------------
-// MULTI-TENANCY
-// ----------------------------------------------------------------
-// stores.json sigue viviendo como archivo (no en Supabase): es un
-// archivo chico que se sube junto con el código (parte del repo), no
-// algo que el server escriba en tiempo de ejecución, así que el
-// filesystem efímero de Render no lo afecta. Para dar de alta un
-// comercio nuevo, agregá una entrada ahí y volvé a desplegar.
-//
-// Formato de stores.json:
-// { "<storeKey>": "<storeId>", "<storeKey>": "<storeId>", ... }
-// ----------------------------------------------------------------
+// ---------------- Tiendas y claves ----------------
+// stores.json: { "<storeId>": { "publicKey": "...", "adminPasswordHash": "scrypt$salt$hash" } }
 function loadStores() {
-  if (!fs.existsSync(STORES_FILE)) {
-    console.error(
-      'ATENCIÓN: no existe stores.json. Ningún request va a poder ' +
-      'identificarse y todos los endpoints van a devolver 401. ' +
-      'Creá stores.json con al menos una tienda (ver stores.example.json).'
-    );
-    return {};
-  }
-  try {
-    return JSON.parse(fs.readFileSync(STORES_FILE, 'utf8'));
-  } catch (e) {
-    console.error('Error leyendo stores.json:', e);
-    return {};
-  }
+  try { return JSON.parse(fs.readFileSync(STORES_FILE, 'utf8')); }
+  catch (e) { console.error('Error leyendo stores.json:', e.message); return {}; }
+}
+const safeEqual = (a, b) => {
+  const A = Buffer.from(String(a)), B = Buffer.from(String(b));
+  return A.length === B.length && crypto.timingSafeEqual(A, B);
+};
+function verifyPassword(password, stored) {
+  const [alg, salt, hash] = String(stored || '').split('$');
+  if (alg !== 'scrypt' || !salt || !hash) return false;
+  const test = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return safeEqual(test, hash);
 }
 
-// Middleware: identifica qué tienda está haciendo el request a partir
-// del header "X-Store-Key" y lo guarda en req.storeId. Si la clave no
-// viene o no es válida, corta acá con 401 (así una tienda nunca puede
-// listar, editar ni borrar pedidos de otra, ni siquiera adivinando IDs).
+// Identifica la tienda por la clave pública.
 function requireStore(req, res, next) {
-  const storeKey = req.header('X-Store-Key');
-  if (!storeKey) {
-    return res.status(401).json({ error: 'Falta el header X-Store-Key.' });
-  }
+  const key = req.header('X-Store-Key');
+  if (!key) return res.status(401).json({ error: 'Falta el header X-Store-Key.' });
   const stores = loadStores();
-  const storeId = stores[storeKey];
-  if (!storeId) {
-    return res.status(401).json({ error: 'Clave de tienda inválida.' });
-  }
+  const storeId = Object.keys(stores).find(id => stores[id].publicKey && safeEqual(stores[id].publicKey, key));
+  if (!storeId) return res.status(401).json({ error: 'Clave de tienda inválida.' });
   req.storeId = storeId;
+  req.storeCfg = stores[storeId];
   next();
 }
 
-// Todos los endpoints de /api/orders*, /api/products* y /api/settings
-// requieren identificar la tienda.
-app.use('/api/orders', requireStore);
-app.use('/api/products', requireStore);
-app.use('/api/settings', requireStore);
+// ---------------- Sesión de admin (token firmado, 12 hs) ----------------
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.createHash('sha256')
+  .update('comanda-session|' + (process.env.SUPABASE_SERVICE_ROLE_KEY || 'dev')).digest('hex');
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const sign = (payload) => crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
 
-// ----------------------------------------------------------------
-// Persistencia en Supabase.
-// ----------------------------------------------------------------
-// Tanto "orders" como "products" viven en Supabase con la misma
-// forma de tabla: una columna "id" (autonumérica, la genera Postgres
-// solo), una columna "store" (a qué tienda pertenece la fila) y una
-// columna "data" (jsonb) con TODO el resto de la información del
-// pedido/producto (client, items, tags, notes, cat, price, img...).
-//
-// Guardar el resto de los campos como jsonb (en vez de una columna
-// por campo) es justamente lo que nos permite no tener que rediseñar
-// una tabla cada vez que se agrega un campo nuevo al pedido o al
-// producto — es el mismo comportamiento flexible que tenían los
-// objetos sueltos en orders.json / products.json, pero ahora
-// persistido en una base de verdad.
-//
-// row2obj junta "id" + "store" + lo de adentro de "data" en un solo
-// objeto plano, que es la forma en la que el panel y el catálogo ya
-// esperan recibir los pedidos/productos (igual que antes).
-// ----------------------------------------------------------------
-function row2obj(row) {
-  return { id: row.id, store: row.store, ...row.data };
+function issueToken(storeId) {
+  const payload = Buffer.from(JSON.stringify({ s: storeId, exp: Date.now() + SESSION_TTL_MS })).toString('base64url');
+  return `${payload}.${sign(payload)}`;
 }
-
-function nowHHMM() {
-  return new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Argentina/Buenos_Aires' }) + 'hs';
-}
-
-function randomCode() {
-  return Math.random().toString(36).slice(2, 10).toUpperCase();
-}
-
-// ----------------------------------------------------------------
-// GET /api/orders
-// El panel llama esto cada pocos segundos para refrescarse.
-// ----------------------------------------------------------------
-app.get('/api/orders', async (req, res) => {
-  const { data, error } = await supabase
-    .from('orders')
-    .select('id, store, data')
-    .eq('store', req.storeId)
-    .order('id', { ascending: false }); // más nuevo primero, igual que antes (unshift)
-
-  if (error) {
-    console.error('Error leyendo pedidos de Supabase:', error);
-    return res.status(500).json({ error: 'No se pudieron leer los pedidos.' });
+function requireAdmin(req, res, next) {
+  const m = /^Bearer (.+)$/.exec(req.header('Authorization') || '');
+  if (m) {
+    const [payload, sig] = m[1].split('.');
+    if (payload && sig && safeEqual(sig, sign(payload))) {
+      try {
+        const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
+        if (data.s === req.storeId && data.exp > Date.now()) return next();
+      } catch (e) { /* cae al 401 */ }
+    }
   }
+  res.status(401).json({ error: 'Sesión de administrador inválida o vencida.' });
+}
+
+// ---------------- Límites simples por IP (en memoria) ----------------
+function makeLimiter(max, windowMs) {
+  const hits = new Map();
+  return {
+    blocked(k) {
+      const now = Date.now();
+      const arr = (hits.get(k) || []).filter(t => now - t < windowMs);
+      hits.set(k, arr);
+      return arr.length >= max;
+    },
+    hit(k) { const a = hits.get(k) || []; a.push(Date.now()); hits.set(k, a); },
+    clear(k) { hits.delete(k); },
+  };
+}
+const loginLimiter = makeLimiter(8, 15 * 60 * 1000);  // 8 intentos fallidos cada 15 min
+const orderLimiter = makeLimiter(15, 10 * 60 * 1000); // 15 pedidos cada 10 min por IP
+
+// ---------------- Helpers ----------------
+const row2obj = (row) => ({ id: row.id, store: row.store, ...row.data });
+const nowHHMM = () => new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Argentina/Buenos_Aires' }) + 'hs';
+const randomCode = () => crypto.randomBytes(6).toString('hex').slice(0, 8).toUpperCase();
+// Texto de usuario: sin caracteres de control ni de marcado HTML, con largo máximo.
+const clean = (v, max) => String(v == null ? '' : v)
+  .replace(/[\u0000-\u001f\u007f]/g, ' ')
+  .replace(/</g, '‹').replace(/>/g, '›').replace(/"/g, '”').replace(/`/g, '´')
+  .trim().slice(0, max);
+const dbError = (res, msg, err) => { console.error(msg, err); return res.status(500).json({ error: msg }); };
+
+// ================================================================
+// RUTAS PÚBLICAS (clave pública)
+// ================================================================
+app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+app.use('/api', requireStore);
+
+app.get('/api/products', async (req, res) => {
+  const { data, error } = await supabase.from('products').select('id, store, data')
+    .eq('store', req.storeId).order('id', { ascending: true });
+  if (error) return dbError(res, 'No se pudieron leer los productos.', error);
   res.json(data.map(row2obj));
 });
 
-// ----------------------------------------------------------------
-// POST /api/orders
-// La tienda (catálogo) llama esto cuando el cliente aprieta
-// "Enviar pedido".
-// Body esperado:
-// {
-//   client: string,
-//   phone: string,
-//   tags: string[],
-//   items: [{name, qty, price}],
-//   shipping: number,
-//   note: string (opcional)
-// }
-// ----------------------------------------------------------------
+const PUBLIC_SETTINGS = ['storeName', 'whatsapp', 'alias', 'categories'];
+app.get('/api/settings', async (req, res) => {
+  const { data, error } = await supabase.from('settings').select('data').eq('store', req.storeId).maybeSingle();
+  if (error) return dbError(res, 'No se pudieron leer los datos del negocio.', error);
+  const all = (data && data.data) || {};
+  const out = {};
+  PUBLIC_SETTINGS.forEach(k => { if (all[k] !== undefined) out[k] = all[k]; });
+  res.json(out);
+});
+
+// Crear pedido (lo usa la tienda). Body: { client, phone, delivery, payment,
+// address?, note?, items: [{ id, qty }] }. Nombre y precio salen de la base.
 app.post('/api/orders', async (req, res) => {
+  if (orderLimiter.blocked(req.ip)) return res.status(429).json({ error: 'Demasiados pedidos seguidos. Probá en unos minutos.' });
   const body = req.body || {};
 
-  if (!Array.isArray(body.items) || body.items.length === 0) {
-    return res.status(400).json({ error: 'El pedido no tiene productos.' });
+  const wanted = new Map(); // id -> qty
+  (Array.isArray(body.items) ? body.items : []).slice(0, 100).forEach(i => {
+    const id = parseInt(i && i.id, 10);
+    const qty = Math.min(999, Math.max(1, parseInt(i && i.qty, 10) || 0));
+    if (Number.isInteger(id) && qty > 0) wanted.set(id, (wanted.get(id) || 0) + qty);
+  });
+  if (wanted.size === 0) return res.status(400).json({ error: 'El pedido no tiene productos.' });
+
+  const client = clean(body.client, 80);
+  const phone = clean(body.phone, 30);
+  if (!client || !phone) return res.status(400).json({ error: 'Faltan el nombre o el teléfono.' });
+  const delivery = body.delivery === 'delivery' ? 'delivery' : 'retira';
+  const payment = ['efectivo', 'transferencia'].includes(body.payment) ? body.payment : '';
+  const address = delivery === 'delivery' ? clean(body.address, 160) : '';
+  if (delivery === 'delivery' && !address) return res.status(400).json({ error: 'Falta la dirección de entrega.' });
+
+  const { data: prods, error: pErr } = await supabase.from('products').select('id, data')
+    .eq('store', req.storeId).in('id', [...wanted.keys()]);
+  if (pErr) return dbError(res, 'No se pudo validar el pedido.', pErr);
+
+  const byId = new Map(prods.map(p => [p.id, p.data || {}]));
+  const items = [];
+  for (const [id, qty] of wanted) {
+    const p = byId.get(id);
+    if (!p) return res.status(400).json({ error: 'Un producto del pedido ya no existe. Actualizá la página.' });
+    if (p.outOfStock) return res.status(400).json({ error: `"${p.name}" está agotado.` });
+    const price = Number(p.offerPrice) || Number(p.price) || 0;
+    items.push({ name: String(p.name), qty, price });
   }
 
   const orderData = {
     code: randomCode(),
-    client: (body.client && String(body.client).trim()) || 'Sin nombre',
-    phone: body.phone ? String(body.phone) : '',
+    client, phone,
     status: 'nuevo',
-    tags: Array.isArray(body.tags) ? body.tags : [],
-    items: body.items.map(i => ({
-      name: String(i.name),
-      qty: Number(i.qty) || 1,
-      price: Number(i.price) || 0,
-    })),
-    shipping: Number(body.shipping) || 0,
-    payment: body.payment ? String(body.payment) : '',
-    address: body.address ? String(body.address) : '',
+    tags: [delivery === 'delivery' ? 'Envío' : 'Retira'],
+    items,
+    shipping: 0,
+    payment, address,
     time: nowHHMM(),
     createdAt: new Date().toISOString(),
-    // "origin: 'client'" identifica la nota que dejó el cliente al hacer
-    // el pedido (se usa para el comprobante en PDF). Los comentarios que
-    // el panel agrega después via PATCH no llevan este campo, para no
-    // mezclarse con anotaciones internas del equipo.
-    notes: body.note ? [{ text: String(body.note), time: nowHHMM(), origin: 'client' }] : [],
-    // "demo: true" marca los pedidos generados por el Modo Demo del
-    // panel (ver comanda-con-panel.html). Viajan por el mismo POST que
-    // un pedido real para no duplicar lógica; este flag solo sirve para
-    // poder identificarlos y borrarlos en bloque después (ver
-    // DELETE /api/orders/demo más abajo). Nunca se muestra al cliente.
-    demo: body.demo === true,
+    notes: body.note ? [{ text: clean(body.note, 400), time: nowHHMM(), origin: 'client' }] : [],
+    demo: false,
   };
 
-  const { data, error } = await supabase
-    .from('orders')
-    .insert({ store: req.storeId, data: orderData })
-    .select('id, store, data')
-    .single();
+  const { data, error } = await supabase.from('orders').insert({ store: req.storeId, data: orderData })
+    .select('id, store, data').single();
+  if (error) return dbError(res, 'No se pudo guardar el pedido.', error);
+  orderLimiter.hit(req.ip);
+  const total = items.reduce((s, i) => s + i.qty * i.price, 0);
+  res.status(201).json({ id: data.id, code: orderData.code, total });
+});
 
-  if (error) {
-    console.error('Error creando pedido en Supabase:', error);
-    return res.status(500).json({ error: 'No se pudo guardar el pedido.' });
-  }
+// ================================================================
+// ADMIN
+// ================================================================
+app.post('/api/admin/login', (req, res) => {
+  const k = `${req.ip}|${req.storeId}`;
+  if (loginLimiter.blocked(k)) return res.status(429).json({ error: 'Demasiados intentos. Esperá 15 minutos.' });
+  const ok = verifyPassword((req.body || {}).password || '', req.storeCfg.adminPasswordHash);
+  if (!ok) { loginLimiter.hit(k); return res.status(401).json({ error: 'Contraseña incorrecta.' }); }
+  loginLimiter.clear(k);
+  res.json({ token: issueToken(req.storeId), expiresInMs: SESSION_TTL_MS });
+});
+
+// Todo lo que sigue exige sesión de admin (middleware requireAdmin).
+
+// ---- Pedidos ----
+app.get('/api/orders', requireAdmin, async (req, res) => {
+  const { data, error } = await supabase.from('orders').select('id, store, data')
+    .eq('store', req.storeId).order('id', { ascending: false });
+  if (error) return dbError(res, 'No se pudieron leer los pedidos.', error);
+  res.json(data.map(row2obj));
+});
+
+// Pedido simulado del Modo Demo (el único caso en que el nombre/precio vienen del panel).
+app.post('/api/orders/demo', requireAdmin, async (req, res) => {
+  const b = req.body || {};
+  if (!Array.isArray(b.items) || b.items.length === 0) return res.status(400).json({ error: 'El pedido no tiene productos.' });
+  const orderData = {
+    code: randomCode(),
+    client: clean(b.client, 80) || 'Sin nombre',
+    phone: clean(b.phone, 30),
+    status: 'nuevo',
+    tags: Array.isArray(b.tags) ? b.tags.filter(t => ['Envío', 'Retira', 'Urgente'].includes(t)) : [],
+    items: b.items.slice(0, 100).map(i => ({ name: clean(i.name, 120), qty: Number(i.qty) || 1, price: Number(i.price) || 0 })),
+    shipping: Number(b.shipping) || 0,
+    payment: clean(b.payment, 20),
+    address: clean(b.address, 160),
+    time: nowHHMM(),
+    createdAt: new Date().toISOString(),
+    notes: b.note ? [{ text: clean(b.note, 400), time: nowHHMM(), origin: 'client' }] : [],
+    demo: true,
+  };
+  const { data, error } = await supabase.from('orders').insert({ store: req.storeId, data: orderData })
+    .select('id, store, data').single();
+  if (error) return dbError(res, 'No se pudo guardar el pedido demo.', error);
   res.status(201).json(row2obj(data));
 });
 
-// ----------------------------------------------------------------
-// PATCH /api/orders/:id
-// El panel llama esto para: cambiar el estado, tocar las etiquetas
-// o agregar un comentario interno.
-// Body esperado (todos los campos son opcionales, mandá solo el que
-// quieras actualizar):
-// { status?: string, tags?: string[], note?: string }
-// ----------------------------------------------------------------
-app.patch('/api/orders/:id', async (req, res) => {
+app.patch('/api/orders/:id', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const body = req.body || {};
-
-  const { data: existing, error: fetchError } = await supabase
-    .from('orders')
-    .select('id, store, data')
-    .eq('id', id)
-    .eq('store', req.storeId)
-    .maybeSingle();
-
-  if (fetchError) {
-    console.error('Error buscando pedido en Supabase:', fetchError);
-    return res.status(500).json({ error: 'No se pudo buscar el pedido.' });
-  }
+  const { data: existing, error: fErr } = await supabase.from('orders').select('id, store, data')
+    .eq('id', id).eq('store', req.storeId).maybeSingle();
+  if (fErr) return dbError(res, 'No se pudo buscar el pedido.', fErr);
   if (!existing) return res.status(404).json({ error: 'Pedido no encontrado.' });
 
-  const orderData = { ...existing.data };
-  if (typeof body.status === 'string') {
-    orderData.status = body.status;
-  }
-  if (Array.isArray(body.tags)) {
-    orderData.tags = body.tags;
-  }
-  if (typeof body.note === 'string' && body.note.trim()) {
-    orderData.notes = [...(orderData.notes || []), { text: body.note.trim(), time: nowHHMM() }];
-  }
+  const d = { ...existing.data };
+  if (typeof body.status === 'string' && ['nuevo', 'progreso', 'completado', 'cancelado'].includes(body.status)) d.status = body.status;
+  if (Array.isArray(body.tags)) d.tags = body.tags.map(t => clean(t, 30)).filter(Boolean).slice(0, 10);
+  if (typeof body.note === 'string' && body.note.trim()) d.notes = [...(d.notes || []), { text: clean(body.note, 400), time: nowHHMM() }];
 
-  const { data: updated, error: updateError } = await supabase
-    .from('orders')
-    .update({ data: orderData })
-    .eq('id', id)
-    .eq('store', req.storeId)
-    .select('id, store, data')
-    .single();
-
-  if (updateError) {
-    console.error('Error actualizando pedido en Supabase:', updateError);
-    return res.status(500).json({ error: 'No se pudo actualizar el pedido.' });
-  }
+  const { data: updated, error: uErr } = await supabase.from('orders').update({ data: d })
+    .eq('id', id).eq('store', req.storeId).select('id, store, data').single();
+  if (uErr) return dbError(res, 'No se pudo actualizar el pedido.', uErr);
   res.json(row2obj(updated));
 });
 
-// ----------------------------------------------------------------
-// DELETE /api/orders/demo
-// Borra únicamente los pedidos generados por el Modo Demo del panel
-// (los que tienen demo:true), sin tocar los pedidos reales. Lo usa el
-// botón "Reiniciar datos de la demo".
-// IMPORTANTE: esta ruta tiene que estar declarada ANTES que
-// DELETE /api/orders/:id, si no Express interpretaría "demo" como un
-// :id y nunca llegaría acá.
-// ----------------------------------------------------------------
-app.delete('/api/orders/demo', async (req, res) => {
-  const { data: rows, error: fetchError } = await supabase
-    .from('orders')
-    .select('id, data')
-    .eq('store', req.storeId);
-
-  if (fetchError) {
-    console.error('Error buscando pedidos demo en Supabase:', fetchError);
-    return res.status(500).json({ error: 'No se pudieron buscar los pedidos demo.' });
-  }
-
-  const idsToDelete = rows.filter(r => r.data && r.data.demo).map(r => r.id);
-  if (idsToDelete.length === 0) return res.json({ ok: true, deleted: 0 });
-
-  const { error: deleteError } = await supabase
-    .from('orders')
-    .delete()
-    .in('id', idsToDelete)
-    .eq('store', req.storeId);
-
-  if (deleteError) {
-    console.error('Error borrando pedidos demo en Supabase:', deleteError);
-    return res.status(500).json({ error: 'No se pudieron borrar los pedidos demo.' });
-  }
-  res.json({ ok: true, deleted: idsToDelete.length });
+// IMPORTANTE: /demo va antes que /:id
+app.delete('/api/orders/demo', requireAdmin, async (req, res) => {
+  const { data: rows, error } = await supabase.from('orders').select('id, data').eq('store', req.storeId);
+  if (error) return dbError(res, 'No se pudieron buscar los pedidos demo.', error);
+  const ids = rows.filter(r => r.data && r.data.demo).map(r => r.id);
+  if (!ids.length) return res.json({ ok: true, deleted: 0 });
+  const { error: dErr } = await supabase.from('orders').delete().in('id', ids).eq('store', req.storeId);
+  if (dErr) return dbError(res, 'No se pudieron borrar los pedidos demo.', dErr);
+  res.json({ ok: true, deleted: ids.length });
 });
 
-// ----------------------------------------------------------------
-// DELETE /api/orders/:id
-// Elimina un pedido puntual (lo usa el botón "Eliminar" del panel).
-// ----------------------------------------------------------------
-app.delete('/api/orders/:id', async (req, res) => {
+app.delete('/api/orders/:id', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
-
-  const { data: deleted, error } = await supabase
-    .from('orders')
-    .delete()
-    .eq('id', id)
-    .eq('store', req.storeId)
-    .select('id');
-
-  if (error) {
-    console.error('Error borrando pedido en Supabase:', error);
-    return res.status(500).json({ error: 'No se pudo borrar el pedido.' });
-  }
-  if (!deleted || deleted.length === 0) return res.status(404).json({ error: 'Pedido no encontrado.' });
+  const { data: deleted, error } = await supabase.from('orders').delete()
+    .eq('id', id).eq('store', req.storeId).select('id');
+  if (error) return dbError(res, 'No se pudo borrar el pedido.', error);
+  if (!deleted || !deleted.length) return res.status(404).json({ error: 'Pedido no encontrado.' });
   res.json({ ok: true });
 });
 
-// ----------------------------------------------------------------
-// POST /api/orders/clear
-// Borra en lote todos los pedidos que estén en alguno de los
-// estados indicados (pensado para "Vaciar completados y
-// cancelados" y así no dejar que el panel se llene de pedidos
-// viejos). Body esperado: { statuses: ["completado","cancelado"] }
-// ----------------------------------------------------------------
-app.post('/api/orders/clear', async (req, res) => {
-  const statuses = Array.isArray(req.body?.statuses) ? req.body.statuses : [];
-  if (statuses.length === 0) {
-    return res.status(400).json({ error: 'Falta indicar qué estados vaciar.' });
-  }
-
-  const { data: rows, error: fetchError } = await supabase
-    .from('orders')
-    .select('id, data')
-    .eq('store', req.storeId);
-
-  if (fetchError) {
-    console.error('Error buscando pedidos a vaciar en Supabase:', fetchError);
-    return res.status(500).json({ error: 'No se pudieron buscar los pedidos.' });
-  }
-
-  const idsToDelete = rows.filter(r => statuses.includes(r.data && r.data.status)).map(r => r.id);
-  if (idsToDelete.length === 0) return res.json({ ok: true, deleted: 0 });
-
-  const { error: deleteError } = await supabase
-    .from('orders')
-    .delete()
-    .in('id', idsToDelete)
-    .eq('store', req.storeId);
-
-  if (deleteError) {
-    console.error('Error vaciando pedidos en Supabase:', deleteError);
-    return res.status(500).json({ error: 'No se pudieron vaciar los pedidos.' });
-  }
-  res.json({ ok: true, deleted: idsToDelete.length });
+app.post('/api/orders/clear', requireAdmin, async (req, res) => {
+  const statuses = Array.isArray(req.body && req.body.statuses) ? req.body.statuses : [];
+  if (!statuses.length) return res.status(400).json({ error: 'Falta indicar qué estados vaciar.' });
+  const { data: rows, error } = await supabase.from('orders').select('id, data').eq('store', req.storeId);
+  if (error) return dbError(res, 'No se pudieron buscar los pedidos.', error);
+  const ids = rows.filter(r => statuses.includes(r.data && r.data.status)).map(r => r.id);
+  if (!ids.length) return res.json({ ok: true, deleted: 0 });
+  const { error: dErr } = await supabase.from('orders').delete().in('id', ids).eq('store', req.storeId);
+  if (dErr) return dbError(res, 'No se pudieron vaciar los pedidos.', dErr);
+  res.json({ ok: true, deleted: ids.length });
 });
 
-// ================================================================
-// PRODUCTOS (catálogo)
-// ================================================================
-
-// ----------------------------------------------------------------
-// GET /api/products
-// El panel (y el catálogo) lo llama al cargar la página para traer
-// el catálogo guardado de ESA tienda.
-// ----------------------------------------------------------------
-app.get('/api/products', async (req, res) => {
-  // Supabase devuelve como máximo 1000 filas por consulta. Si no se
-  // pagina, los productos con id más alto (los últimos cargados)
-  // quedan afuera sin ningún error. Por eso se lee de a páginas.
-  const PAGE = 1000;
-  let all = [];
-  for (let from = 0; ; from += PAGE) {
-    const { data, error } = await supabase
-      .from('products')
-      .select('id, store, data')
-      .eq('store', req.storeId)
-      .order('id', { ascending: true })
-      .range(from, from + PAGE - 1);
-
-    if (error) {
-      console.error('Error leyendo productos de Supabase:', error);
-      return res.status(500).json({ error: 'No se pudieron leer los productos.' });
-    }
-    all = all.concat(data);
-    if (data.length < PAGE) break;
-  }
-  res.json(all.map(row2obj));
-});
-
-// ----------------------------------------------------------------
-// POST /api/products/seed
-// Carga el catálogo inicial (el que viene escrito en el HTML) la
-// PRIMERA vez que una tienda entra al panel. Si esa tienda ya tiene
-// productos guardados, no hace nada y devuelve los que ya existen
-// — así se puede llamar sin miedo cada vez que carga la página, sin
-// riesgo de duplicar productos.
-// Body esperado: { products: [ {cat, name, price, ...}, ... ] }
-// ----------------------------------------------------------------
-app.post('/api/products/seed', async (req, res) => {
-  const body = req.body || {};
-  const incoming = Array.isArray(body.products) ? body.products : [];
-
-  const { data: existing, error: fetchError } = await supabase
-    .from('products')
-    .select('id, store, data')
-    .eq('store', req.storeId);
-
-  if (fetchError) {
-    console.error('Error chequeando catálogo existente en Supabase:', fetchError);
-    return res.status(500).json({ error: 'No se pudo chequear el catálogo.' });
-  }
-
-  if (existing.length > 0) {
-    return res.json({ seeded: false, products: existing.map(row2obj) });
-  }
-
-  const rowsToInsert = incoming.map((p) => {
-    const { id, store, ...rest } = p || {}; // ignoramos id/store que mande el cliente
-    return { store: req.storeId, data: rest };
-  });
-
-  if (rowsToInsert.length === 0) {
-    return res.json({ seeded: true, products: [] });
-  }
-
-  const { data: created, error: insertError } = await supabase
-    .from('products')
-    .insert(rowsToInsert)
-    .select('id, store, data');
-
-  if (insertError) {
-    console.error('Error sembrando catálogo en Supabase:', insertError);
-    return res.status(500).json({ error: 'No se pudo guardar el catálogo inicial.' });
-  }
+// ---- Productos ----
+app.post('/api/products/seed', requireAdmin, async (req, res) => {
+  const incoming = Array.isArray(req.body && req.body.products) ? req.body.products : [];
+  const { data: existing, error } = await supabase.from('products').select('id, store, data').eq('store', req.storeId);
+  if (error) return dbError(res, 'No se pudo chequear el catálogo.', error);
+  if (existing.length > 0) return res.json({ seeded: false, products: existing.map(row2obj) });
+  const rows = incoming.map(p => { const { id, store, ...rest } = p || {}; return { store: req.storeId, data: rest }; });
+  if (!rows.length) return res.json({ seeded: true, products: [] });
+  const { data: created, error: iErr } = await supabase.from('products').insert(rows).select('id, store, data');
+  if (iErr) return dbError(res, 'No se pudo guardar el catálogo inicial.', iErr);
   res.json({ seeded: true, products: created.map(row2obj) });
 });
 
-// ----------------------------------------------------------------
-// POST /api/products
-// Crea un producto nuevo (lo usa el botón "Agregar producto" del panel).
-// Body esperado: { cat, name, price, offerPrice?, outOfStock?, img?, ... }
-// ----------------------------------------------------------------
-app.post('/api/products', async (req, res) => {
+app.post('/api/products', requireAdmin, async (req, res) => {
   const body = req.body || {};
-  if (!body.name || typeof body.price === 'undefined') {
-    return res.status(400).json({ error: 'Falta nombre o precio del producto.' });
-  }
-
-  const { id, store, ...rest } = body; // ignoramos id/store que mande el cliente
-
-  const { data: created, error } = await supabase
-    .from('products')
-    .insert({ store: req.storeId, data: rest })
-    .select('id, store, data')
-    .single();
-
-  if (error) {
-    console.error('Error creando producto en Supabase:', error);
-    return res.status(500).json({ error: 'No se pudo guardar el producto.' });
-  }
+  if (!body.name || typeof body.price === 'undefined') return res.status(400).json({ error: 'Falta nombre o precio del producto.' });
+  const { id, store, ...rest } = body;
+  const { data: created, error } = await supabase.from('products').insert({ store: req.storeId, data: rest })
+    .select('id, store, data').single();
+  if (error) return dbError(res, 'No se pudo guardar el producto.', error);
   res.status(201).json(row2obj(created));
 });
 
-// ----------------------------------------------------------------
-// PATCH /api/products/:id
-// Edita cualquier campo del producto (precio, oferta, agotado, foto,
-// nombre, categoría, etc.). Mandá solo los campos que querés cambiar.
-// Para BORRAR un campo (ej: sacar la oferta o la foto), mandalo en
-// null: { "offerPrice": null } elimina offerPrice del producto.
-// ----------------------------------------------------------------
-app.patch('/api/products/:id', async (req, res) => {
+// Mandar un campo en null lo elimina del producto.
+app.patch('/api/products/:id', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const body = req.body || {};
-
-  const { data: existing, error: fetchError } = await supabase
-    .from('products')
-    .select('id, store, data')
-    .eq('id', id)
-    .eq('store', req.storeId)
-    .maybeSingle();
-
-  if (fetchError) {
-    console.error('Error buscando producto en Supabase:', fetchError);
-    return res.status(500).json({ error: 'No se pudo buscar el producto.' });
-  }
+  const { data: existing, error: fErr } = await supabase.from('products').select('id, store, data')
+    .eq('id', id).eq('store', req.storeId).maybeSingle();
+  if (fErr) return dbError(res, 'No se pudo buscar el producto.', fErr);
   if (!existing) return res.status(404).json({ error: 'Producto no encontrado.' });
-
-  const productData = { ...existing.data };
-  Object.keys(body).forEach((key) => {
-    if (key === 'id' || key === 'store') return; // no se pueden pisar
-    if (body[key] === null) {
-      delete productData[key];
-    } else {
-      productData[key] = body[key];
-    }
+  const d = { ...existing.data };
+  Object.keys(body).forEach(k => {
+    if (k === 'id' || k === 'store') return;
+    if (body[k] === null) delete d[k]; else d[k] = body[k];
   });
-
-  const { data: updated, error: updateError } = await supabase
-    .from('products')
-    .update({ data: productData })
-    .eq('id', id)
-    .eq('store', req.storeId)
-    .select('id, store, data')
-    .single();
-
-  if (updateError) {
-    console.error('Error actualizando producto en Supabase:', updateError);
-    return res.status(500).json({ error: 'No se pudo actualizar el producto.' });
-  }
+  const { data: updated, error: uErr } = await supabase.from('products').update({ data: d })
+    .eq('id', id).eq('store', req.storeId).select('id, store, data').single();
+  if (uErr) return dbError(res, 'No se pudo actualizar el producto.', uErr);
   res.json(row2obj(updated));
 });
 
-// ----------------------------------------------------------------
-// POST /api/products/:id/image
-// Sube la foto de un producto a Supabase Storage y guarda en el
-// producto la URL pública resultante (no el base64). El frontend ya
-// redimensiona/comprime la foto antes de mandarla acá (ver
-// resizeImageToDataURL en el catálogo), así que este endpoint solo
-// se encarga de subirla y de reemplazar el campo "img".
-// Body esperado: { dataUrl: "data:image/jpeg;base64,...." }
-// ----------------------------------------------------------------
-app.post('/api/products/:id/image', async (req, res) => {
+app.post('/api/products/:id/image', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const { dataUrl } = req.body || {};
+  const m = typeof dataUrl === 'string' && dataUrl.match(/^data:(image\/(?:jpeg|png|webp|gif));base64,(.+)$/);
+  if (!m) return res.status(400).json({ error: 'Falta o es inválida la imagen (jpeg, png, webp o gif).' });
+  const mime = m[1];
+  const ext = mime.split('/')[1].replace('jpeg', 'jpg');
+  const buffer = Buffer.from(m[2], 'base64');
+  if (buffer.length > 3 * 1024 * 1024) return res.status(413).json({ error: 'La imagen pesa más de 3 MB.' });
 
-  const match = typeof dataUrl === 'string'
-    && dataUrl.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/);
-  if (!match) {
-    return res.status(400).json({ error: 'Falta o es inválida la imagen (dataUrl).' });
-  }
-  const mime = match[1];
-  const ext = (mime.split('/')[1] || 'jpg').split('+')[0];
-  const buffer = Buffer.from(match[2], 'base64');
-
-  // Ruta separada por tienda, para que las fotos de un comercio nunca
-  // se mezclen ni se puedan pisar con las de otro.
-  const filePath = `${req.storeId}/${id}-${Date.now()}.${ext}`;
-
-  const { error: uploadError } = await supabase.storage
-    .from(PRODUCT_IMAGES_BUCKET)
-    .upload(filePath, buffer, { contentType: mime, upsert: true });
-
-  if (uploadError) {
-    console.error('Error subiendo imagen a Supabase Storage:', uploadError);
-    return res.status(500).json({ error: 'No se pudo subir la imagen.' });
-  }
-
-  const { data: publicUrlData } = supabase.storage
-    .from(PRODUCT_IMAGES_BUCKET)
-    .getPublicUrl(filePath);
-  const imageUrl = publicUrlData.publicUrl;
-
-  const { data: existing, error: fetchError } = await supabase
-    .from('products')
-    .select('id, store, data')
-    .eq('id', id)
-    .eq('store', req.storeId)
-    .maybeSingle();
-
-  if (fetchError) {
-    console.error('Error buscando producto en Supabase:', fetchError);
-    return res.status(500).json({ error: 'No se pudo buscar el producto.' });
-  }
+  const { data: existing, error: fErr } = await supabase.from('products').select('id, store, data')
+    .eq('id', id).eq('store', req.storeId).maybeSingle();
+  if (fErr) return dbError(res, 'No se pudo buscar el producto.', fErr);
   if (!existing) return res.status(404).json({ error: 'Producto no encontrado.' });
 
-  const productData = { ...existing.data, img: imageUrl };
+  const filePath = `${req.storeId}/${id}-${Date.now()}.${ext}`;
+  const { error: upErr } = await supabase.storage.from(PRODUCT_IMAGES_BUCKET)
+    .upload(filePath, buffer, { contentType: mime, upsert: true });
+  if (upErr) return dbError(res, 'No se pudo subir la imagen.', upErr);
+  const { data: pub } = supabase.storage.from(PRODUCT_IMAGES_BUCKET).getPublicUrl(filePath);
 
-  const { data: updated, error: updateError } = await supabase
-    .from('products')
-    .update({ data: productData })
-    .eq('id', id)
-    .eq('store', req.storeId)
-    .select('id, store, data')
-    .single();
-
-  if (updateError) {
-    console.error('Error guardando la URL de la imagen en el producto:', updateError);
-    return res.status(500).json({ error: 'No se pudo actualizar el producto con la nueva foto.' });
-  }
-
+  const { data: updated, error: uErr } = await supabase.from('products')
+    .update({ data: { ...existing.data, img: pub.publicUrl } })
+    .eq('id', id).eq('store', req.storeId).select('id, store, data').single();
+  if (uErr) return dbError(res, 'No se pudo actualizar el producto con la nueva foto.', uErr);
   res.json(row2obj(updated));
 });
 
-// ----------------------------------------------------------------
-// DELETE /api/products/:id
-// Elimina un producto puntual (lo usa el botón "Eliminar" del panel).
-// ----------------------------------------------------------------
-app.delete('/api/products/:id', async (req, res) => {
+app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
-
-  const { data: deleted, error } = await supabase
-    .from('products')
-    .delete()
-    .eq('id', id)
-    .eq('store', req.storeId)
-    .select('id');
-
-  if (error) {
-    console.error('Error borrando producto en Supabase:', error);
-    return res.status(500).json({ error: 'No se pudo borrar el producto.' });
-  }
-  if (!deleted || deleted.length === 0) return res.status(404).json({ error: 'Producto no encontrado.' });
+  const { data: deleted, error } = await supabase.from('products').delete()
+    .eq('id', id).eq('store', req.storeId).select('id');
+  if (error) return dbError(res, 'No se pudo borrar el producto.', error);
+  if (!deleted || !deleted.length) return res.status(404).json({ error: 'Producto no encontrado.' });
   res.json({ ok: true });
 });
 
-// ----------------------------------------------------------------
-// GET /api/settings
-// Trae los datos generales del negocio (nombre, WhatsApp, alias de
-// transferencia) de ESTA tienda. Si todavía no guardó nada (primera
-// vez), devuelve un objeto vacío: el frontend se queda con los
-// valores que ya trae fijos en el HTML.
-// ----------------------------------------------------------------
-app.get('/api/settings', async (req, res) => {
-  const { data, error } = await supabase
-    .from('settings')
-    .select('data')
-    .eq('store', req.storeId)
-    .maybeSingle();
-
-  if (error) {
-    console.error('Error leyendo datos del negocio en Supabase:', error);
-    return res.status(500).json({ error: 'No se pudieron leer los datos del negocio.' });
-  }
-  res.json((data && data.data) || {});
-});
-
-// ----------------------------------------------------------------
-// PATCH /api/settings
-// Guarda cambios en los datos generales del negocio (lo usa la
-// pestaña "Datos" del panel). Mandá solo los campos que querés
-// actualizar, por ejemplo: { "storeName": "Nuevo nombre" }.
-// Body esperado (todos opcionales): { storeName?, whatsapp?, alias? }
-// ----------------------------------------------------------------
-app.patch('/api/settings', async (req, res) => {
+// ---- Datos del negocio ----
+app.patch('/api/settings', requireAdmin, async (req, res) => {
   const body = req.body || {};
-
-  const { data: existing, error: fetchError } = await supabase
-    .from('settings')
-    .select('data')
-    .eq('store', req.storeId)
-    .maybeSingle();
-
-  if (fetchError) {
-    console.error('Error buscando datos del negocio en Supabase:', fetchError);
-    return res.status(500).json({ error: 'No se pudieron leer los datos del negocio.' });
-  }
-
+  const { data: existing, error: fErr } = await supabase.from('settings').select('data').eq('store', req.storeId).maybeSingle();
+  if (fErr) return dbError(res, 'No se pudieron leer los datos del negocio.', fErr);
   const merged = { ...((existing && existing.data) || {}), ...body };
-  delete merged.store; // no se puede pisar la clave de la tienda
-
-  const { data: upserted, error: upsertError } = await supabase
-    .from('settings')
+  delete merged.store;
+  const { data: up, error: uErr } = await supabase.from('settings')
     .upsert({ store: req.storeId, data: merged, updated_at: new Date().toISOString() }, { onConflict: 'store' })
-    .select('data')
-    .single();
-
-  if (upsertError) {
-    console.error('Error guardando datos del negocio en Supabase:', upsertError);
-    return res.status(500).json({ error: 'No se pudieron guardar los datos del negocio.' });
-  }
-  res.json(upserted.data);
+    .select('data').single();
+  if (uErr) return dbError(res, 'No se pudieron guardar los datos del negocio.', uErr);
+  res.json(up.data);
 });
 
-app.get('/api/health', (req, res) => res.json({ ok: true }));
-
-app.listen(PORT, () => {
-  console.log(`Backend de pedidos corriendo en el puerto ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Backend de pedidos corriendo en el puerto ${PORT}`));
 
